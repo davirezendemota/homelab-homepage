@@ -1,0 +1,26 @@
+services:
+  homepage:
+    build: .
+    container_name: homelab-homepage
+    restart: unless-stopped
+    ports:
+      - "80:8000"
+    environment:
+      TZ: America/Sao_Paulo
+      HOST: "0.0.0.0"
+      PORT: "8000"
+      DOCKER_SOCKET: /var/run/docker.sock
+      HOST_ROOT: /host
+    volumes:
+      # Monta o código local — editar app.py recarrega sem rebuild
+      - ./app.py:/app/app.py:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # Raiz do host para ler mounts e uso de disco reais
+      - /:/host:ro,rslave
+    group_add:
+      - "990"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
