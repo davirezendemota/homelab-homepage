@@ -988,7 +988,7 @@ def render_page(req_host: str) -> str:
     }}
     .row {{
       display: grid;
-      grid-template-columns: minmax(0, 1.8fr) minmax(0, 0.9fr) minmax(0, 0.85fr) minmax(0, 0.7fr) 72px;
+      grid-template-columns: minmax(0, 1.5fr) minmax(0, 0.9fr) minmax(0, 0.85fr) minmax(0, 0.7fr) 72px;
       align-items: center;
       gap: 12px;
       padding: 14px 20px;
@@ -1342,6 +1342,9 @@ def render_page(req_host: str) -> str:
     }}
     .settings-body {{
       padding: 18px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
     }}
     .settings-option {{
       display: flex;
@@ -1369,6 +1372,77 @@ def render_page(req_host: str) -> str:
       color: #7d8695;
       line-height: 1.4;
     }}
+    body.compact-view .stack-block {{
+      margin-bottom: 24px;
+    }}
+    body.compact-view .stack-head {{
+      margin-bottom: 6px;
+    }}
+    body.compact-view .stack-body {{
+      background: #11151d;
+      border: 1px solid #1c232e;
+      border-radius: 10px;
+      overflow: hidden;
+    }}
+    body.compact-view .stack-body .row {{
+      border: none;
+      border-radius: 0;
+      margin-bottom: 0;
+      padding: 6px 12px;
+      gap: 8px;
+      border-bottom: 1px solid #1a2030;
+    }}
+    body.compact-view .stack-body .row:last-child {{
+      border-bottom: none;
+    }}
+    body.compact-view .stack-block > .row {{
+      padding: 6px 12px;
+      margin-bottom: 4px;
+      gap: 8px;
+      border-radius: 8px;
+    }}
+    body.compact-view .row {{
+      grid-template-columns: minmax(0, 1.4fr) minmax(0, 0.85fr) minmax(0, 0.8fr) minmax(0, 0.65fr) 60px;
+    }}
+    body.compact-view .status-dot {{
+      width: 7px;
+      height: 7px;
+      box-shadow: none !important;
+    }}
+    body.compact-view .row-name {{
+      gap: 8px;
+    }}
+    body.compact-view .name-text {{
+      font-size: 12.5px;
+    }}
+    body.compact-view .image-text {{
+      font-size: 11px;
+    }}
+    body.compact-view .status-pill {{
+      font-size: 11px;
+      padding: 2px 7px;
+    }}
+    body.compact-view .port-link {{
+      font-size: 11px;
+      padding: 2px 6px;
+      border-radius: 5px;
+    }}
+    body.compact-view .no-ports {{
+      font-size: 12px;
+    }}
+    body.compact-view .logs-btn,
+    body.compact-view .fav-btn,
+    body.compact-view .hide-btn {{
+      width: 28px;
+      height: 28px;
+      border-radius: 6px;
+    }}
+    body.compact-view .logs-btn svg,
+    body.compact-view .fav-btn svg,
+    body.compact-view .hide-btn svg {{
+      width: 14px;
+      height: 14px;
+    }}
     @media (max-width: 960px) {{
       .page {{ padding: 28px 20px 48px; }}
       .meters {{ grid-template-columns: repeat(2, 1fr); }}
@@ -1381,6 +1455,9 @@ def render_page(req_host: str) -> str:
       .image-text,
       .status-cell,
       .ports {{ grid-column: 1 / -1; }}
+      body.compact-view .row {{
+        gap: 6px;
+      }}
     }}
     @media (max-width: 560px) {{
       .meters {{ grid-template-columns: 1fr; }}
@@ -1448,6 +1525,13 @@ def render_page(req_host: str) -> str:
         <button type="button" class="modal-close" id="settings-close" aria-label="Fechar">×</button>
       </div>
       <div class="modal-body settings-body">
+        <label class="settings-option">
+          <input type="checkbox" id="settings-compact-view">
+          <span class="settings-option-text">
+            <span class="settings-option-label">Visualização compacta</span>
+            <span class="settings-option-hint">Linhas mais densas, com containers agrupados por stack</span>
+          </span>
+        </label>
         <label class="settings-option">
           <input type="checkbox" id="settings-truncate-names">
           <span class="settings-option-text">
@@ -1654,9 +1738,12 @@ def render_page(req_host: str) -> str:
       try {{
         const raw = localStorage.getItem(SETTINGS_KEY);
         const data = raw ? JSON.parse(raw) : {{}};
-        return {{ truncateNames: Boolean(data.truncateNames) }};
+        return {{
+          compactView: Boolean(data.compactView),
+          truncateNames: Boolean(data.truncateNames),
+        }};
       }} catch {{
-        return {{ truncateNames: false }};
+        return {{ compactView: false, truncateNames: false }};
       }}
     }}
 
@@ -1665,9 +1752,12 @@ def render_page(req_host: str) -> str:
     }}
 
     function applySettings() {{
+      document.body.classList.toggle("compact-view", settings.compactView);
       document.body.classList.toggle("truncate-names", settings.truncateNames);
-      const checkbox = document.getElementById("settings-truncate-names");
-      if (checkbox) checkbox.checked = settings.truncateNames;
+      const compactCheckbox = document.getElementById("settings-compact-view");
+      if (compactCheckbox) compactCheckbox.checked = settings.compactView;
+      const truncateCheckbox = document.getElementById("settings-truncate-names");
+      if (truncateCheckbox) truncateCheckbox.checked = settings.truncateNames;
     }}
 
     function openSettings() {{
@@ -1681,6 +1771,12 @@ def render_page(req_host: str) -> str:
       if (document.getElementById("logs-modal").hidden) {{
         document.body.style.overflow = "";
       }}
+    }}
+
+    function setCompactView(enabled) {{
+      settings.compactView = enabled;
+      saveSettings();
+      applySettings();
     }}
 
     function setTruncateNames(enabled) {{
@@ -2393,6 +2489,9 @@ def render_page(req_host: str) -> str:
 
     document.getElementById("settings-open").addEventListener("click", openSettings);
     document.getElementById("settings-close").addEventListener("click", closeSettings);
+    document.getElementById("settings-compact-view").addEventListener("change", (e) => {{
+      setCompactView(e.target.checked);
+    }});
     document.getElementById("settings-truncate-names").addEventListener("change", (e) => {{
       setTruncateNames(e.target.checked);
     }});
