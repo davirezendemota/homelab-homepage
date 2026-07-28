@@ -12,10 +12,14 @@ import re
 import shutil
 import socket
 import socketserver
+import sqlite3
 import sys
+import threading
 import time
 import urllib.parse
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from copy import deepcopy
 
 HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "8000"))
@@ -23,6 +27,30 @@ DOCKER_SOCKET = os.environ.get("DOCKER_SOCKET", "/var/run/docker.sock")
 HOST_ROOT = os.environ.get("HOST_ROOT", "/host").rstrip("/")
 SAFE_CONTAINER_REF = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 LOG_TAIL = 200
+CACHE_FAST_INTERVAL = 5.0
+CACHE_STORAGE_INTERVAL = 60.0
+DB_PATH = os.environ.get("DB_PATH", "/app/data/homepage.db")
+DEFAULT_SETTINGS = {"compactView": False, "truncateNames": False}
+_db_lock = threading.Lock()
+_DB_SCHEMA = """
+CREATE TABLE IF NOT EXISTS favorites (
+    position INTEGER NOT NULL,
+    name TEXT NOT NULL PRIMARY KEY
+);
+CREATE TABLE IF NOT EXISTS hidden_containers (
+    name TEXT NOT NULL PRIMARY KEY
+);
+CREATE TABLE IF NOT EXISTS hidden_stacks (
+    name TEXT NOT NULL PRIMARY KEY
+);
+CREATE TABLE IF NOT EXISTS collapsed_stacks (
+    stack_key TEXT NOT NULL PRIMARY KEY
+);
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT NOT NULL PRIMARY KEY,
+    value TEXT NOT NULL
+);
+"""
 
 
 class UnixHTTPConnection(http.client.HTTPConnection):
@@ -195,6 +223,568 @@ def ram_stats() -> tuple[int, float, float]:
     used_kb = max(0, total_kb - avail_kb)
     pct = round(used_kb / total_kb * 100)
     return pct, used_kb / (1024**2), total_kb / (1024**2)
+
+
+PREFERRED_HWMON_NAMES = frozenset(
+    {"coretemp", "k10temp", "zenpower", "applesmc", "cpu_thermal", "soc_thermal"}
+)
+SKIP_HWMON_NAMES = frozenset({"acpitz"})
+
+
+def _sysfs_roots() -> list[str]:
+    if _using_host_storage():
+        return [HOST_ROOT, ""]
+    return [""]
+
+
+def _sysfs_path(root: str, *parts: str) -> str:
+    path = os.path.join(root, *parts) if root else os.path.join("/", *parts)
+    return path
+
+
+def _read_temp_millidegrees(path: str) -> int | None:
+    try:
+        with open(path, encoding="utf-8") as f:
+            val = int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+    if val <= 0 or val > 150_000:
+        return None
+    return val
+
+
+def _hwmon_readings(root: str) -> list[tuple[str, int]]:
+    hwmon_dir = _sysfs_path(root, "sys", "class", "hwmon")
+    rows: list[tuple[str, int]] = []
+    try:
+        entries = sorted(os.listdir(hwmon_dir))
+    except OSError:
+        return rows
+    for entry in entries:
+        if not entry.startswith("hwmon"):
+            continue
+        base = os.path.join(hwmon_dir, entry)
+        sensor_name = "sensor"
+        try:
+            with open(os.path.join(base, "name"), encoding="utf-8") as f:
+                sensor_name = f.read().strip() or sensor_name
+        except OSError:
+            pass
+        try:
+            files = sorted(os.listdir(base))
+        except OSError:
+            continue
+        for fname in files:
+            if not fname.startswith("temp") or not fname.endswith("_input"):
+                continue
+            val = _read_temp_millidegrees(os.path.join(base, fname))
+            if val is not None:
+                rows.append((sensor_name, val))
+    return rows
+
+
+def _thermal_zone_readings(root: str) -> list[tuple[str, int]]:
+    thermal_dir = _sysfs_path(root, "sys", "class", "thermal")
+    rows: list[tuple[str, int]] = []
+    try:
+        entries = sorted(os.listdir(thermal_dir))
+    except OSError:
+        return rows
+    for entry in entries:
+        if not entry.startswith("thermal_zone"):
+            continue
+        base = os.path.join(thermal_dir, entry)
+        zone_type = "thermal"
+        try:
+            with open(os.path.join(base, "type"), encoding="utf-8") as f:
+                zone_type = f.read().strip() or zone_type
+        except OSError:
+            pass
+        val = _read_temp_millidegrees(os.path.join(base, "temp"))
+        if val is not None:
+            rows.append((zone_type, val))
+    return rows
+
+
+def temperature_stats() -> tuple[float | None, str]:
+    hwmon: list[tuple[str, int]] = []
+    thermal: list[tuple[str, int]] = []
+    for root in _sysfs_roots():
+        hwmon.extend(_hwmon_readings(root))
+        thermal.extend(_thermal_zone_readings(root))
+
+    preferred_hwmon = [val for name, val in hwmon if name in PREFERRED_HWMON_NAMES]
+    if preferred_hwmon:
+        return max(preferred_hwmon) / 1000, "CPU"
+
+    pkg_thermal = [
+        val for name, val in thermal if "pkg" in name.lower() or "cpu" in name.lower()
+    ]
+    if pkg_thermal:
+        return max(pkg_thermal) / 1000, "CPU"
+
+    fallback_hwmon = [val for name, val in hwmon if name not in SKIP_HWMON_NAMES]
+    if fallback_hwmon:
+        return max(fallback_hwmon) / 1000, "CPU"
+
+    if thermal:
+        return max(val for _, val in thermal) / 1000, "Sistema"
+
+    return None, ""
+
+
+def temperature_color(celsius: float) -> str:
+    if celsius >= 85:
+        return "#f85149"
+    if celsius >= 65:
+        return "#e3b341"
+    return "#3fb950"
+
+
+def temperature_sensor_details() -> list[dict]:
+    rows: list[dict] = []
+    seen: set[str] = set()
+
+    for root in _sysfs_roots():
+        hwmon_dir = _sysfs_path(root, "sys", "class", "hwmon")
+        try:
+            entries = sorted(os.listdir(hwmon_dir))
+        except OSError:
+            continue
+        for entry in entries:
+            if not entry.startswith("hwmon"):
+                continue
+            base = os.path.join(hwmon_dir, entry)
+            chip = "sensor"
+            try:
+                with open(os.path.join(base, "name"), encoding="utf-8") as f:
+                    chip = f.read().strip() or chip
+            except OSError:
+                pass
+            try:
+                files = sorted(os.listdir(base))
+            except OSError:
+                continue
+            for fname in files:
+                if not fname.startswith("temp") or not fname.endswith("_input"):
+                    continue
+                val = _read_temp_millidegrees(os.path.join(base, fname))
+                if val is None:
+                    continue
+                label = chip
+                label_path = os.path.join(base, fname.replace("_input", "_label"))
+                try:
+                    with open(label_path, encoding="utf-8") as f:
+                        part = f.read().strip()
+                        if part:
+                            label = f"{chip} · {part}"
+                except OSError:
+                    pass
+                key = f"{root}:{label}"
+                if key in seen:
+                    continue
+                seen.add(key)
+                celsius = val / 1000
+                rows.append(
+                    {
+                        "name": label,
+                        "value": celsius,
+                        "display": f"{celsius:.0f}°C",
+                    }
+                )
+
+        thermal_dir = _sysfs_path(root, "sys", "class", "thermal")
+        try:
+            zones = sorted(os.listdir(thermal_dir))
+        except OSError:
+            continue
+        for entry in zones:
+            if not entry.startswith("thermal_zone"):
+                continue
+            base = os.path.join(thermal_dir, entry)
+            zone_type = "thermal"
+            try:
+                with open(os.path.join(base, "type"), encoding="utf-8") as f:
+                    zone_type = f.read().strip() or zone_type
+            except OSError:
+                pass
+            val = _read_temp_millidegrees(os.path.join(base, "temp"))
+            if val is None:
+                continue
+            label = f"{entry} · {zone_type}"
+            key = f"{root}:{label}"
+            if key in seen:
+                continue
+            seen.add(key)
+            celsius = val / 1000
+            rows.append(
+                {
+                    "name": label,
+                    "value": celsius,
+                    "display": f"{celsius:.0f}°C",
+                }
+            )
+
+    rows.sort(key=lambda row: row["value"], reverse=True)
+    return rows
+
+
+def _format_bytes(size: int) -> str:
+    if size >= 1024**3:
+        return f"{size / 1024**3:.1f} GB"
+    if size >= 1024**2:
+        return f"{size / 1024**2:.1f} MB"
+    if size >= 1024:
+        return f"{size / 1024:.0f} KB"
+    return f"{size} B"
+
+
+def _format_pct(value: float) -> str:
+    if value <= 0:
+        return "0%"
+    for decimals in (1, 2, 3, 4):
+        if round(value, decimals) > 0:
+            return f"{value:.{decimals}f}%"
+    return f"{value:.4f}%"
+
+
+def _container_name(container: dict) -> str:
+    names = [n.lstrip("/") for n in (container.get("Names") or [])]
+    cid = container.get("Id") or ""
+    return names[0] if names else cid[:12]
+
+
+def _container_stack(container: dict) -> str:
+    labels = container.get("Labels") or {}
+    return labels.get("com.docker.compose.project") or "sem stack"
+
+
+def _container_cpu_pct(stats: dict) -> float:
+    cpu = stats.get("cpu_stats") or {}
+    precpu = stats.get("precpu_stats") or {}
+    cpu_usage = (cpu.get("cpu_usage") or {}).get("total_usage")
+    pre_cpu_usage = (precpu.get("cpu_usage") or {}).get("total_usage")
+    system_usage = cpu.get("system_cpu_usage")
+    pre_system_usage = precpu.get("system_cpu_usage")
+    if None in (cpu_usage, pre_cpu_usage, system_usage, pre_system_usage):
+        return 0.0
+    cpu_delta = cpu_usage - pre_cpu_usage
+    system_delta = system_usage - pre_system_usage
+    if system_delta <= 0 or cpu_delta < 0:
+        return 0.0
+    online = cpu.get("online_cpus") or 1
+    return (cpu_delta / system_delta) * online * 100.0
+
+
+def _container_memory_bytes(stats: dict) -> int:
+    usage = (stats.get("memory_stats") or {}).get("usage")
+    return int(usage) if isinstance(usage, int) and usage > 0 else 0
+
+
+def _fetch_container_stats(container: dict) -> tuple[dict, dict] | None:
+    cid = container.get("Id") or ""
+    if not cid:
+        return None
+    quoted = urllib.parse.quote(cid, safe="")
+    try:
+        stats = docker_get(f"/containers/{quoted}/stats?stream=false")
+    except RuntimeError:
+        return None
+    return container, stats
+
+
+def _running_container_stats() -> list[tuple[dict, dict]]:
+    containers = docker_get("/containers/json")
+    rows: list[tuple[dict, dict]] = []
+    workers = min(8, max(len(containers), 1))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(_fetch_container_stats, container) for container in containers]
+        for future in as_completed(futures):
+            result = future.result()
+            if result is not None:
+                rows.append(result)
+    return rows
+
+
+def _meter_detail_cpu_from_stats(pairs: list[tuple[dict, dict]]) -> dict:
+    rows: list[dict] = []
+    for container, stats in pairs:
+        pct = _container_cpu_pct(stats)
+        rows.append(
+            {
+                "name": _container_name(container),
+                "sub": _container_stack(container),
+                "value": pct,
+                "display": _format_pct(pct),
+            }
+        )
+    rows.sort(key=lambda row: row["value"], reverse=True)
+    return {"rows": rows, "total": 100}
+
+
+def _meter_detail_ram_from_stats(pairs: list[tuple[dict, dict]]) -> dict:
+    ram_pct, ram_used_gb, ram_total_gb = ram_stats()
+    ram_total_bytes = int(ram_total_gb * (1024**3))
+    rows: list[dict] = []
+    for container, stats in pairs:
+        usage = _container_memory_bytes(stats)
+        pct_of_total = (usage / ram_total_bytes * 100) if ram_total_bytes > 0 else 0.0
+        rows.append(
+            {
+                "name": _container_name(container),
+                "sub": _container_stack(container),
+                "value": usage,
+                "display": f"{_format_bytes(usage)} · {_format_pct(pct_of_total)}",
+            }
+        )
+    rows.sort(key=lambda row: row["value"], reverse=True)
+    return {
+        "rows": rows,
+        "total": max(ram_total_bytes, 1),
+        "summary": {
+            "sub": f"{ram_used_gb:.1f} / {ram_total_gb:.0f} GB",
+            "display": f"{ram_pct}%",
+        },
+    }
+
+
+def meter_detail_cpu() -> dict:
+    return _meter_detail_cpu_from_stats(_running_container_stats())
+
+
+def meter_detail_ram() -> dict:
+    return _meter_detail_ram_from_stats(_running_container_stats())
+
+
+def _image_display_name(image: dict) -> str:
+    tags = image.get("RepoTags") or []
+    if tags:
+        return tags[0]
+    image_id = image.get("Id") or ""
+    if image_id.startswith("sha256:"):
+        return image_id[7:19]
+    return image_id or "sem tag"
+
+
+def meter_detail_storage() -> dict:
+    df = docker_get("/system/df")
+    volume_sizes = {
+        vol.get("Name", ""): int((vol.get("UsageData") or {}).get("Size") or 0)
+        for vol in df.get("Volumes") or []
+    }
+
+    container_rows: list[dict] = []
+    for container in df.get("Containers") or []:
+        writable = int(container.get("SizeRw") or 0)
+        image_layer = int(container.get("SizeRootFs") or 0)
+        volumes = 0
+        for mount in container.get("Mounts") or []:
+            if (mount.get("Type") or "").lower() != "volume":
+                continue
+            volumes += volume_sizes.get(mount.get("Name") or "", 0)
+        total = writable + image_layer + volumes
+        container_rows.append(
+            {
+                "name": _container_name(container),
+                "sub": _container_stack(container),
+                "value": total,
+                "display": _format_bytes(total),
+                "writable": _format_bytes(writable),
+                "image": _format_bytes(image_layer),
+                "volumes": _format_bytes(volumes),
+            }
+        )
+    container_rows.sort(key=lambda row: row["value"], reverse=True)
+
+    image_rows: list[dict] = []
+    for image in df.get("Images") or []:
+        size = int(image.get("Size") or 0)
+        image_rows.append(
+            {
+                "name": _image_display_name(image),
+                "sub": f"{image.get('Containers', 0)} container(s)",
+                "value": size,
+                "display": _format_bytes(size),
+            }
+        )
+    image_rows.sort(key=lambda row: row["value"], reverse=True)
+
+    volume_rows: list[dict] = []
+    for volume in df.get("Volumes") or []:
+        size = int((volume.get("UsageData") or {}).get("Size") or 0)
+        ref_count = int((volume.get("UsageData") or {}).get("RefCount") or 0)
+        volume_rows.append(
+            {
+                "name": volume.get("Name") or "volume",
+                "sub": f"{ref_count} referência(s)",
+                "value": size,
+                "display": _format_bytes(size),
+            }
+        )
+    volume_rows.sort(key=lambda row: row["value"], reverse=True)
+
+    build_rows: list[dict] = []
+    for entry in df.get("BuildCache") or []:
+        size = int(entry.get("Size") or 0)
+        description = entry.get("Description") or entry.get("ID") or "build cache"
+        shared = "compartilhado" if entry.get("Shared") else "exclusivo"
+        build_rows.append(
+            {
+                "name": description,
+                "sub": shared,
+                "value": size,
+                "display": _format_bytes(size),
+            }
+        )
+    build_rows.sort(key=lambda row: row["value"], reverse=True)
+
+    main_disk, extra_mounts = storage_mounts()
+    _, _, storage_total_gb = _storage_aggregate(main_disk, extra_mounts)
+    storage_total_bytes = max(int(storage_total_gb * (1024**3)), 1)
+
+    return {
+        "total": storage_total_bytes,
+        "sections": [
+            {"title": "Containers", "rows": container_rows, "columns": ["writable", "image", "volumes"]},
+            {"title": "Imagens", "rows": image_rows},
+            {"title": "Volumes", "rows": volume_rows},
+            {"title": "Build cache", "rows": build_rows},
+        ],
+    }
+
+
+def meter_detail_temp() -> dict:
+    return {"rows": temperature_sensor_details(), "total": 100}
+
+
+METER_DETAIL_HANDLERS = {
+    "cpu": meter_detail_cpu,
+    "ram": meter_detail_ram,
+    "storage": meter_detail_storage,
+    "temp": meter_detail_temp,
+}
+
+
+class MetricsCache:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._last_storage_refresh = 0.0
+        self._containers: list[dict] = []
+        self._meters: list[dict] = []
+        self._status_error: str | None = None
+        self._meter_details: dict[str, dict] = {}
+
+    def warm(self) -> None:
+        self._refresh_fast()
+        self._refresh_storage()
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(
+            target=self._loop, name="metrics-cache", daemon=True
+        )
+        self._thread.start()
+
+    def _loop(self) -> None:
+        while not self._stop.wait(CACHE_FAST_INTERVAL):
+            self._refresh_fast()
+            if time.monotonic() - self._last_storage_refresh >= CACHE_STORAGE_INTERVAL:
+                self._refresh_storage()
+
+    def _refresh_fast(self) -> None:
+        containers: list[dict] | None = None
+        meters: list[dict] | None = None
+        status_error: str | None = None
+        meter_updates: dict[str, dict] = {}
+
+        try:
+            containers = running_containers()
+        except Exception as exc:  # noqa: BLE001
+            status_error = str(exc)
+
+        try:
+            meters = build_meters()
+        except Exception as exc:  # noqa: BLE001
+            if status_error is None:
+                status_error = str(exc)
+
+        try:
+            meter_updates["temp"] = meter_detail_temp()
+        except Exception as exc:  # noqa: BLE001
+            meter_updates["temp"] = {"error": str(exc)}
+
+        try:
+            stats_pairs = _running_container_stats()
+            meter_updates["cpu"] = _meter_detail_cpu_from_stats(stats_pairs)
+            meter_updates["ram"] = _meter_detail_ram_from_stats(stats_pairs)
+        except Exception as exc:  # noqa: BLE001
+            meter_updates["cpu"] = {"error": str(exc)}
+            meter_updates["ram"] = {"error": str(exc)}
+
+        with self._lock:
+            if containers is not None:
+                self._containers = containers
+            if meters is not None:
+                self._meters = meters
+            if status_error is not None:
+                self._status_error = status_error
+            elif containers is not None:
+                self._status_error = None
+            for kind, data in meter_updates.items():
+                if "error" not in data or kind not in self._meter_details:
+                    self._meter_details[kind] = data
+
+    def _refresh_storage(self) -> None:
+        try:
+            data = meter_detail_storage()
+        except Exception as exc:  # noqa: BLE001
+            with self._lock:
+                if "storage" not in self._meter_details:
+                    self._meter_details["storage"] = {"error": str(exc)}
+            return
+
+        with self._lock:
+            self._meter_details["storage"] = data
+            self._last_storage_refresh = time.monotonic()
+
+    def page_payload(self, req_host: str) -> dict:
+        with self._lock:
+            return {
+                "host": req_host,
+                "build": app_build(),
+                "loaded_build": _MODULE_BUILD,
+                "error": self._status_error,
+                "containers": deepcopy(self._containers),
+                "meters": deepcopy(self._meters),
+            }
+
+    def meter_detail(self, kind: str) -> dict:
+        with self._lock:
+            data = self._meter_details.get(kind)
+            if data is None:
+                return {"kind": kind, "error": "Dados ainda não disponíveis"}
+            payload = deepcopy(data)
+            payload["kind"] = kind
+            return payload
+
+
+_METRICS_CACHE: MetricsCache | None = None
+
+
+def get_metrics_cache() -> MetricsCache:
+    global _METRICS_CACHE
+    if _METRICS_CACHE is None:
+        _METRICS_CACHE = MetricsCache()
+    return _METRICS_CACHE
+
+
+def meter_detail_payload(kind: str) -> dict:
+    if kind not in METER_DETAIL_HANDLERS:
+        raise ValueError("Tipo de métrica inválido")
+    return get_metrics_cache().meter_detail(kind)
 
 
 MAIN_DISK_COLOR = "#3fb950"
@@ -459,11 +1049,45 @@ def _storage_aggregate(main: dict, extras: list[dict]) -> tuple[int, float, floa
     return pct, total_used, total_gb
 
 
-def build_meters(container_count: int) -> list[dict]:
+def build_meters() -> list[dict]:
     cpu, ncpu = cpu_percent()
     ram_pct, ram_used, ram_total = ram_stats()
+    temp_c, temp_label = temperature_stats()
     main_disk, extra_mounts = storage_mounts()
     storage_pct, storage_used, storage_total = _storage_aggregate(main_disk, extra_mounts)
+
+    if temp_c is None:
+        temp_meter = {
+            "label": "Temperatura",
+            "display": "—",
+            "sub": "indisponível",
+            "showSub": True,
+            "color": "#8b94a3",
+            "barWidth": "0%",
+            "showBar": False,
+            "showCaption": False,
+            "caption": "",
+            "detailKey": "temp",
+        }
+    else:
+        temp_pct = round(min(100.0, max(0.0, temp_c)))
+        temp_color = temperature_color(temp_c)
+        temp_meter = {
+            "label": "Temperatura",
+            "display": f"{temp_c:.0f}°C",
+            "sub": temp_label,
+            "showSub": True,
+            "color": temp_color,
+            "barWidth": f"{temp_pct}%",
+            "showBar": True,
+            "showChart": True,
+            "chartKey": "temp",
+            "pct": temp_pct,
+            "showCaption": False,
+            "caption": "",
+            "detailKey": "temp",
+        }
+
     return [
         {
             "label": "CPU",
@@ -478,6 +1102,7 @@ def build_meters(container_count: int) -> list[dict]:
             "pct": cpu,
             "showCaption": False,
             "caption": "",
+            "detailKey": "cpu",
         },
         {
             "label": "RAM",
@@ -492,7 +1117,9 @@ def build_meters(container_count: int) -> list[dict]:
             "pct": ram_pct,
             "showCaption": False,
             "caption": "",
+            "detailKey": "ram",
         },
+        temp_meter,
         {
             "label": "Armazenamento",
             "type": "storage",
@@ -506,17 +1133,7 @@ def build_meters(container_count: int) -> list[dict]:
             "caption": "",
             "main": main_disk,
             "mounts": extra_mounts,
-        },
-        {
-            "label": "Containers",
-            "display": str(container_count),
-            "sub": "",
-            "showSub": False,
-            "color": "#e6e9ef",
-            "barWidth": "0%",
-            "showBar": False,
-            "showCaption": True,
-            "caption": f"{container_count} em execução",
+            "detailKey": "storage",
         },
     ]
 
@@ -536,22 +1153,112 @@ def reload_if_stale() -> None:
         os.execv(sys.executable, [sys.executable, "-u", __file__])
 
 
-def page_payload(req_host: str) -> dict:
-    error: str | None = None
-    containers: list[dict] = []
-    try:
-        containers = running_containers()
-    except Exception as exc:  # noqa: BLE001
-        error = str(exc)
+def init_db() -> None:
+    db_dir = os.path.dirname(DB_PATH)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
+    with _db_lock:
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            conn.executescript(_DB_SCHEMA)
+            conn.commit()
+        finally:
+            conn.close()
 
+
+def _db_connect() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _read_prefs(conn: sqlite3.Connection) -> dict:
+    favorites = [
+        row["name"]
+        for row in conn.execute("SELECT name FROM favorites ORDER BY position ASC")
+    ]
+    hidden_containers = [
+        row["name"] for row in conn.execute("SELECT name FROM hidden_containers ORDER BY name")
+    ]
+    hidden_stacks = [
+        row["name"] for row in conn.execute("SELECT name FROM hidden_stacks ORDER BY name")
+    ]
+    collapsed_stacks = [
+        row["stack_key"]
+        for row in conn.execute("SELECT stack_key FROM collapsed_stacks ORDER BY stack_key")
+    ]
+    settings = dict(DEFAULT_SETTINGS)
+    for row in conn.execute("SELECT key, value FROM settings"):
+        if row["key"] in settings:
+            settings[row["key"]] = row["value"] == "true"
     return {
-        "host": req_host,
-        "build": app_build(),
-        "loaded_build": _MODULE_BUILD,
-        "error": error,
-        "containers": containers,
-        "meters": build_meters(len(containers)),
+        "favorites": favorites,
+        "hiddenContainers": hidden_containers,
+        "hiddenStacks": hidden_stacks,
+        "collapsedStacks": collapsed_stacks,
+        "settings": settings,
     }
+
+
+def get_prefs() -> dict:
+    with _db_lock:
+        conn = _db_connect()
+        try:
+            return _read_prefs(conn)
+        finally:
+            conn.close()
+
+
+def update_prefs(data: dict) -> dict:
+    with _db_lock:
+        conn = _db_connect()
+        try:
+            if "favorites" in data:
+                names = [str(name) for name in data["favorites"]]
+                conn.execute("DELETE FROM favorites")
+                conn.executemany(
+                    "INSERT INTO favorites (position, name) VALUES (?, ?)",
+                    list(enumerate(names)),
+                )
+            if "hiddenContainers" in data:
+                names = [str(name) for name in data["hiddenContainers"]]
+                conn.execute("DELETE FROM hidden_containers")
+                conn.executemany(
+                    "INSERT INTO hidden_containers (name) VALUES (?)",
+                    [(name,) for name in names],
+                )
+            if "hiddenStacks" in data:
+                names = [str(name) for name in data["hiddenStacks"]]
+                conn.execute("DELETE FROM hidden_stacks")
+                conn.executemany(
+                    "INSERT INTO hidden_stacks (name) VALUES (?)",
+                    [(name,) for name in names],
+                )
+            if "collapsedStacks" in data:
+                keys = [str(key) for key in data["collapsedStacks"]]
+                conn.execute("DELETE FROM collapsed_stacks")
+                conn.executemany(
+                    "INSERT INTO collapsed_stacks (stack_key) VALUES (?)",
+                    [(key,) for key in keys],
+                )
+            if "settings" in data:
+                settings = data["settings"]
+                if isinstance(settings, dict):
+                    for key in DEFAULT_SETTINGS:
+                        if key in settings:
+                            conn.execute(
+                                "INSERT INTO settings (key, value) VALUES (?, ?) "
+                                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                                (key, "true" if settings[key] else "false"),
+                            )
+            conn.commit()
+            return _read_prefs(conn)
+        finally:
+            conn.close()
+
+
+def page_payload(req_host: str) -> dict:
+    return get_metrics_cache().page_payload(req_host)
 
 
 def render_page(req_host: str) -> str:
@@ -670,6 +1377,7 @@ def render_page(req_host: str) -> str:
       margin-bottom: 26px;
     }}
     .meter {{
+      position: relative;
       background: #141922;
       border: 1px solid #1e2530;
       border-radius: 12px;
@@ -677,10 +1385,44 @@ def render_page(req_host: str) -> str:
       min-width: 0;
       overflow: hidden;
     }}
+    .meter-expand-btn {{
+      position: absolute;
+      top: 10px;
+      right: 10px;
+      z-index: 2;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      width: 26px;
+      height: 26px;
+      padding: 0;
+      color: #5b6472;
+      background: transparent;
+      border: 1px solid transparent;
+      border-radius: 7px;
+      cursor: pointer;
+      transition: color .12s, background .12s, border-color .12s;
+    }}
+    .meter:hover .meter-expand-btn,
+    .meter:focus-within .meter-expand-btn {{
+      display: inline-flex;
+    }}
+    .meter-expand-btn:hover {{
+      color: #c9d1de;
+      background: #1a2230;
+      border-color: #2a3544;
+    }}
+    .meter-expand-btn svg {{
+      width: 14px;
+      height: 14px;
+      display: block;
+    }}
     .meter-top {{
+      position: relative;
       display: flex;
       align-items: baseline;
-      justify-content: space-between;
+      justify-content: flex-start;
+      min-height: 18px;
     }}
     .meter-label {{
       font-size: 12px;
@@ -690,9 +1432,18 @@ def render_page(req_host: str) -> str:
       text-transform: uppercase;
     }}
     .meter-sub {{
+      position: absolute;
+      top: 0;
+      right: 10px;
       font-family: 'JetBrains Mono', monospace;
       font-size: 11px;
       color: #5b6472;
+      white-space: nowrap;
+      transition: right .15s ease;
+    }}
+    .meter:hover .meter-sub,
+    .meter:focus-within .meter-sub {{
+      right: 42px;
     }}
     .meter-value {{
       font-size: 26px;
@@ -969,7 +1720,6 @@ def render_page(req_host: str) -> str:
       opacity: .42;
       margin-top: 8px;
       padding-top: 28px;
-      border-top: 1px dashed #2a3544;
       transition: opacity .12s ease;
     }}
     .hidden-stacks:hover {{
@@ -1170,6 +1920,29 @@ def render_page(req_host: str) -> str:
       backdrop-filter: blur(6px);
     }}
     .modal-backdrop[hidden] {{ display: none; }}
+    #meter-modal {{
+      gap: 14px;
+    }}
+    .modal-nav-btn {{
+      flex-shrink: 0;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 42px;
+      height: 42px;
+      padding: 0;
+      border: 1px solid #2a3544;
+      border-radius: 50%;
+      background: rgba(15, 19, 26, .92);
+      color: #c9d1de;
+      cursor: pointer;
+      transition: color .12s, background .12s, border-color .12s;
+    }}
+    .modal-nav-btn:hover {{ background: #1a2230; color: #fff; }}
+    .modal-nav-btn svg {{
+      width: 20px;
+      height: 20px;
+    }}
     .modal {{
       width: min(920px, 100%);
       height: min(78vh, 760px);
@@ -1185,6 +1958,11 @@ def render_page(req_host: str) -> str:
       width: min(420px, 100%);
       height: auto;
       max-height: min(70vh, 480px);
+    }}
+    .modal.modal-md {{
+      width: min(760px, 100%);
+      height: auto;
+      max-height: min(78vh, 720px);
     }}
     .modal-head {{
       display: flex;
@@ -1372,6 +2150,106 @@ def render_page(req_host: str) -> str:
       color: #7d8695;
       line-height: 1.4;
     }}
+    .meter-detail-loading,
+    .meter-detail-empty,
+    .meter-detail-error {{
+      padding: 28px 18px;
+      text-align: center;
+      font-size: 14px;
+      color: #7d8695;
+    }}
+    .meter-detail-error {{
+      color: #f85149;
+    }}
+    .meter-detail-summary {{
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 16px 18px;
+      border-bottom: 1px solid #1a2030;
+    }}
+    .meter-detail-summary-sub {{
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 13px;
+      color: #c9d1de;
+    }}
+    .meter-detail-summary-pct {{
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 18px;
+      font-weight: 700;
+      color: #e6e9ef;
+      white-space: nowrap;
+    }}
+    .meter-detail-section {{
+      padding: 0 18px 18px;
+    }}
+    .meter-detail-section:first-child {{
+      padding-top: 18px;
+    }}
+    .meter-detail-section-title {{
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+      color: #7d8695;
+      margin-bottom: 10px;
+    }}
+    .meter-detail-row {{
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 100px 72px;
+      gap: 8px 16px;
+      align-items: center;
+      padding: 10px 0;
+      border-bottom: 1px solid #1a2030;
+    }}
+    .meter-detail-row:last-child {{
+      border-bottom: none;
+    }}
+    .meter-detail-info {{
+      min-width: 0;
+    }}
+    .meter-detail-name {{
+      font-size: 13px;
+      font-weight: 600;
+      color: #e6e9ef;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }}
+    .meter-detail-sub,
+    .meter-detail-meta {{
+      margin-top: 2px;
+      font-size: 11px;
+      color: #7d8695;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }}
+    .meter-detail-meta {{
+      font-family: 'JetBrains Mono', monospace;
+      color: #5b6472;
+    }}
+    .meter-detail-bar {{
+      height: 6px;
+      border-radius: 20px;
+      background: #1e2530;
+      overflow: hidden;
+      min-width: 0;
+    }}
+    .meter-detail-bar > span {{
+      display: block;
+      height: 100%;
+      border-radius: 20px;
+    }}
+    .meter-detail-value {{
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 12px;
+      font-weight: 600;
+      color: #c9d1de;
+      text-align: right;
+      white-space: nowrap;
+    }}
     body.compact-view .stack-block {{
       margin-bottom: 24px;
     }}
@@ -1463,6 +2341,9 @@ def render_page(req_host: str) -> str:
       .meters {{ grid-template-columns: 1fr; }}
       h1 {{ font-size: 24px; }}
       .modal {{ height: min(88vh, 760px); }}
+      #meter-modal {{ gap: 8px; padding: 16px 8px; }}
+      .modal-nav-btn {{ width: 36px; height: 36px; }}
+      .modal-nav-btn svg {{ width: 18px; height: 18px; }}
     }}
   </style>
 </head>
@@ -1543,6 +2424,25 @@ def render_page(req_host: str) -> str:
     </div>
   </div>
 
+  <div id="meter-modal" class="modal-backdrop" hidden>
+    <button type="button" class="modal-nav-btn" id="meter-prev" title="Anterior" aria-label="Métrica anterior">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m15 18-6-6 6-6"/></svg>
+    </button>
+    <div class="modal modal-md" role="dialog" aria-modal="true" aria-labelledby="meter-modal-title">
+      <div class="modal-head">
+        <div class="modal-title-wrap">
+          <span class="modal-label">Detalhes</span>
+          <div class="modal-title" id="meter-modal-title"></div>
+        </div>
+        <button type="button" class="modal-close" id="meter-close" aria-label="Fechar">×</button>
+      </div>
+      <div class="modal-body" id="meter-modal-body"></div>
+    </div>
+    <button type="button" class="modal-nav-btn" id="meter-next" title="Próximo" aria-label="Próxima métrica">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
+    </button>
+  </div>
+
   <div id="logs-modal" class="modal-backdrop" hidden>
     <div class="modal" role="dialog" aria-modal="true" aria-labelledby="logs-modal-title">
       <div class="modal-head">
@@ -1557,6 +2457,9 @@ def render_page(req_host: str) -> str:
           </span>
           <button type="button" class="modal-icon-btn" id="logs-copy" title="Copiar logs" aria-label="Copiar logs">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+          </button>
+          <button type="button" class="modal-icon-btn" id="logs-clear" title="Limpar logs" aria-label="Limpar logs">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M10 11v6M14 11v6"/></svg>
           </button>
           <button type="button" class="modal-close" id="logs-close" aria-label="Fechar">×</button>
         </div>
@@ -1583,33 +2486,125 @@ def render_page(req_host: str) -> str:
     const HIDE_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94"/><path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19"/><line x1="1" y1="1" x2="23" y2="23"/></svg>`;
     const CHEVRON_DOWN = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>`;
     const CHEVRON_UP = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m18 15-6-6-6 6"/></svg>`;
-    const FAV_KEY = "homelab-homepage-favorites";
-    const HIDDEN_KEY = "homelab-homepage-hidden";
-    const HIDDEN_STACKS_KEY = "homelab-homepage-hidden-stacks";
-    const COLLAPSED_KEY = "homelab-homepage-collapsed-stacks";
-    const SETTINGS_KEY = "homelab-homepage-settings";
+    const EXPAND_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 3h6v6"/><path d="m21 3-7 7"/><path d="M9 21H3v-6"/><path d="m3 21 7-7"/></svg>`;
 
-    let favorites = loadFavorites();
-    let hiddenContainers = loadHidden();
-    let hiddenStacks = loadHiddenStacks();
-    let collapsedStacks = loadCollapsedStacks();
-    let settings = loadSettings();
+    let favorites = new Set();
+    let hiddenContainers = new Set();
+    let hiddenStacks = new Set();
+    let collapsedStacks = new Set();
+    let settings = {{ compactView: false, truncateNames: false }};
     let logsAbort = null;
     let logsStickBottom = true;
     let copyResetTimer = null;
 
-    function loadFavorites() {{
+    const LEGACY_KEYS = {{
+      favorites: "homelab-homepage-favorites",
+      hiddenContainers: "homelab-homepage-hidden",
+      hiddenStacks: "homelab-homepage-hidden-stacks",
+      collapsedStacks: "homelab-homepage-collapsed-stacks",
+      settings: "homelab-homepage-settings",
+    }};
+
+    function readLegacyList(key) {{
       try {{
-        const raw = localStorage.getItem(FAV_KEY);
+        const raw = localStorage.getItem(key);
         const list = raw ? JSON.parse(raw) : [];
-        return new Set(Array.isArray(list) ? list.map(String) : []);
+        return Array.isArray(list) ? list.map(String) : [];
       }} catch {{
-        return new Set();
+        return [];
+      }}
+    }}
+
+    function readLegacyPrefs() {{
+      let settingsData = {{}};
+      try {{
+        const raw = localStorage.getItem(LEGACY_KEYS.settings);
+        settingsData = raw ? JSON.parse(raw) : {{}};
+      }} catch {{
+        settingsData = {{}};
+      }}
+      return {{
+        favorites: readLegacyList(LEGACY_KEYS.favorites),
+        hiddenContainers: readLegacyList(LEGACY_KEYS.hiddenContainers),
+        hiddenStacks: readLegacyList(LEGACY_KEYS.hiddenStacks),
+        collapsedStacks: readLegacyList(LEGACY_KEYS.collapsedStacks),
+        settings: {{
+          compactView: Boolean(settingsData.compactView),
+          truncateNames: Boolean(settingsData.truncateNames),
+        }},
+      }};
+    }}
+
+    function hasLegacyPrefs() {{
+      return Object.values(LEGACY_KEYS).some((key) => localStorage.getItem(key) !== null);
+    }}
+
+    function clearLegacyPrefs() {{
+      Object.values(LEGACY_KEYS).forEach((key) => localStorage.removeItem(key));
+    }}
+
+    function hasAnyPrefs(prefs) {{
+      return !!(
+        prefs.favorites?.length ||
+        prefs.hiddenContainers?.length ||
+        prefs.hiddenStacks?.length ||
+        prefs.collapsedStacks?.length ||
+        prefs.settings?.compactView ||
+        prefs.settings?.truncateNames
+      );
+    }}
+
+    function applyPrefs(prefs) {{
+      favorites = new Set(prefs.favorites || []);
+      hiddenContainers = new Set(prefs.hiddenContainers || []);
+      hiddenStacks = new Set(prefs.hiddenStacks || []);
+      collapsedStacks = new Set(prefs.collapsedStacks || []);
+      settings = {{
+        compactView: Boolean(prefs.settings?.compactView),
+        truncateNames: Boolean(prefs.settings?.truncateNames),
+      }};
+    }}
+
+    async function loadPrefs() {{
+      const legacy = hasLegacyPrefs() ? readLegacyPrefs() : null;
+
+      const res = await fetch("/api/prefs", {{ cache: "no-store" }});
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      let prefs = await res.json();
+
+      if (legacy) {{
+        if (!hasAnyPrefs(prefs) && hasAnyPrefs(legacy)) {{
+          const putRes = await fetch("/api/prefs", {{
+            method: "PUT",
+            headers: {{ "Content-Type": "application/json" }},
+            body: JSON.stringify(legacy),
+          }});
+          if (!putRes.ok) throw new Error("HTTP " + putRes.status);
+          prefs = await putRes.json();
+        }}
+        clearLegacyPrefs();
+      }}
+
+      applyPrefs(prefs);
+    }}
+
+    async function savePrefs(partial) {{
+      try {{
+        const res = await fetch("/api/prefs", {{
+          method: "PUT",
+          headers: {{ "Content-Type": "application/json" }},
+          body: JSON.stringify(partial),
+        }});
+        if (!res.ok) throw new Error("HTTP " + res.status);
+      }} catch (e) {{
+        const err = document.getElementById("error");
+        err.hidden = false;
+        err.textContent = "Falha ao salvar preferências: " + (e && e.message ? e.message : e);
       }}
     }}
 
     function saveFavorites() {{
-      localStorage.setItem(FAV_KEY, JSON.stringify([...favorites]));
+      savePrefs({{ favorites: [...favorites] }});
     }}
 
     function isFavorite(name) {{
@@ -1623,29 +2618,11 @@ def render_page(req_host: str) -> str:
       render();
     }}
 
-    function loadHidden() {{
-      try {{
-        const raw = localStorage.getItem(HIDDEN_KEY);
-        const list = raw ? JSON.parse(raw) : [];
-        return new Set(Array.isArray(list) ? list.map(String) : []);
-      }} catch {{
-        return new Set();
-      }}
-    }}
-
-    function loadHiddenStacks() {{
-      try {{
-        const raw = localStorage.getItem(HIDDEN_STACKS_KEY);
-        const list = raw ? JSON.parse(raw) : [];
-        return new Set(Array.isArray(list) ? list.map(String) : []);
-      }} catch {{
-        return new Set();
-      }}
-    }}
-
     function saveHidden() {{
-      localStorage.setItem(HIDDEN_KEY, JSON.stringify([...hiddenContainers]));
-      localStorage.setItem(HIDDEN_STACKS_KEY, JSON.stringify([...hiddenStacks]));
+      savePrefs({{
+        hiddenContainers: [...hiddenContainers],
+        hiddenStacks: [...hiddenStacks],
+      }});
     }}
 
     function isHiddenStack(stackName) {{
@@ -1705,18 +2682,8 @@ def render_page(req_host: str) -> str:
       render();
     }}
 
-    function loadCollapsedStacks() {{
-      try {{
-        const raw = localStorage.getItem(COLLAPSED_KEY);
-        const list = raw ? JSON.parse(raw) : [];
-        return new Set(Array.isArray(list) ? list.map(String) : []);
-      }} catch {{
-        return new Set();
-      }}
-    }}
-
     function saveCollapsedStacks() {{
-      localStorage.setItem(COLLAPSED_KEY, JSON.stringify([...collapsedStacks]));
+      savePrefs({{ collapsedStacks: [...collapsedStacks] }});
     }}
 
     function stackKey(stack) {{
@@ -1734,21 +2701,8 @@ def render_page(req_host: str) -> str:
       render();
     }}
 
-    function loadSettings() {{
-      try {{
-        const raw = localStorage.getItem(SETTINGS_KEY);
-        const data = raw ? JSON.parse(raw) : {{}};
-        return {{
-          compactView: Boolean(data.compactView),
-          truncateNames: Boolean(data.truncateNames),
-        }};
-      }} catch {{
-        return {{ compactView: false, truncateNames: false }};
-      }}
-    }}
-
     function saveSettings() {{
-      localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+      savePrefs({{ settings }});
     }}
 
     function applySettings() {{
@@ -1768,7 +2722,7 @@ def render_page(req_host: str) -> str:
 
     function closeSettings() {{
       document.getElementById("settings-modal").hidden = true;
-      if (document.getElementById("logs-modal").hidden) {{
+      if (document.getElementById("logs-modal").hidden && document.getElementById("meter-modal").hidden) {{
         document.body.style.overflow = "";
       }}
     }}
@@ -1889,12 +2843,15 @@ def render_page(req_host: str) -> str:
 
     function groupRowsIntoStacks(rows, {{ withFavorites = false }} = {{}}) {{
       const {{ sortKey, sortDir }} = state;
-      const favRows = [];
+      const favByName = new Map();
       const restRows = [];
       rows.forEach((c) => {{
-        if (withFavorites && isFavorite(c.name)) favRows.push(c);
+        if (withFavorites && isFavorite(c.name)) favByName.set(c.name, c);
         else restRows.push(c);
       }});
+      const favRows = withFavorites
+        ? [...favorites].map((name) => favByName.get(name)).filter(Boolean)
+        : [];
 
       const order = [];
       const map = {{}};
@@ -1916,7 +2873,6 @@ def render_page(req_host: str) -> str:
       }}));
 
       if (favRows.length) {{
-        favRows.sort((a, b) => compareRows(a, b, sortKey, sortDir));
         stacks.unshift({{
           name: "Favoritos",
           count: favRows.length,
@@ -1985,6 +2941,183 @@ def render_page(req_host: str) -> str:
       storageTooltip.hidden = true;
     }}
 
+    function renderMeterExpandBtn(m) {{
+      if (!m.detailKey) return "";
+      return `<button type="button" class="meter-expand-btn" data-meter-detail="${{esc(m.detailKey)}}" data-meter-label="${{esc(m.label)}}" title="Expandir ${{esc(m.label)}}" aria-label="Expandir detalhes de ${{esc(m.label)}}">${{EXPAND_ICON}}</button>`;
+    }}
+
+    function meterBarColor(kind, value) {{
+      if (kind === "temp") {{
+        if (value >= 85) return "#f85149";
+        if (value >= 65) return "#e3b341";
+        return "#3fb950";
+      }}
+      const pct = kind === "cpu" ? value : Math.min(100, value);
+      if (pct >= 85) return "#f85149";
+      if (pct >= 65) return "#e3b341";
+      return "#3fb950";
+    }}
+
+    function renderDetailRow(row, total, kind) {{
+      const pct = total > 0 ? Math.min(100, Math.round((row.value / total) * 100)) : 0;
+      const color = meterBarColor(kind, kind === "cpu" || kind === "temp" ? row.value : pct);
+      const meta = row.writable
+        ? `<div class="meter-detail-meta">RW ${{esc(row.writable)}} · imagem ${{esc(row.image)}} · volumes ${{esc(row.volumes)}}</div>`
+        : "";
+      return `
+        <div class="meter-detail-row">
+          <div class="meter-detail-info">
+            <div class="meter-detail-name" title="${{esc(row.name)}}">${{esc(row.name)}}</div>
+            ${{row.sub ? `<div class="meter-detail-sub">${{esc(row.sub)}}</div>` : ""}}
+            ${{meta}}
+          </div>
+          <div class="meter-detail-bar"><span style="width:${{pct}}%;background:${{esc(color)}}"></span></div>
+          <div class="meter-detail-value">${{esc(row.display)}}</div>
+        </div>
+      `;
+    }}
+
+    function renderDetailSection(section, kind, total) {{
+      const rows = section.rows || [];
+      if (!rows.length) {{
+        return `
+          <div class="meter-detail-section">
+            <div class="meter-detail-section-title">${{esc(section.title)}}</div>
+            <div class="meter-detail-empty">Nenhum item</div>
+          </div>
+        `;
+      }}
+      return `
+        <div class="meter-detail-section">
+          <div class="meter-detail-section-title">${{esc(section.title)}}</div>
+          ${{rows.map((row) => renderDetailRow(row, total, kind)).join("")}}
+        </div>
+      `;
+    }}
+
+    function renderMeterDetailSummary(summary) {{
+      if (!summary) return "";
+      return `
+        <div class="meter-detail-summary">
+          <div class="meter-detail-summary-sub">${{esc(summary.sub || "")}}</div>
+          <div class="meter-detail-summary-pct">${{esc(summary.display || "")}}</div>
+        </div>
+      `;
+    }}
+
+    function renderMeterDetail(data) {{
+      if (data.error) {{
+        return `<div class="meter-detail-error">${{esc(data.error)}}</div>`;
+      }}
+      const total = data.total || 1;
+      const summary = renderMeterDetailSummary(data.summary);
+      if (data.sections) {{
+        return summary + data.sections.map((section) => renderDetailSection(section, data.kind, total)).join("");
+      }}
+      const rows = data.rows || [];
+      if (!rows.length) {{
+        return summary + `<div class="meter-detail-empty">Nenhum dado disponível</div>`;
+      }}
+      return summary + `<div class="meter-detail-section">${{rows.map((row) => renderDetailRow(row, total, data.kind)).join("")}}</div>`;
+    }}
+
+    let meterDetailAbort = null;
+    let meterDetailTimer = null;
+    let meterDetailKind = null;
+
+    function stopMeterDetailRefresh() {{
+      if (meterDetailTimer) {{
+        clearInterval(meterDetailTimer);
+        meterDetailTimer = null;
+      }}
+    }}
+
+    function startMeterDetailRefresh(kind) {{
+      stopMeterDetailRefresh();
+      if (kind !== "cpu") return;
+      meterDetailTimer = setInterval(() => {{
+        if (document.hidden || meterDetailKind !== kind) return;
+        loadMeterDetail(kind);
+      }}, REFRESH_MS);
+    }}
+
+    async function loadMeterDetail(kind, {{ initial = false }} = {{}}) {{
+      const modal = document.getElementById("meter-modal");
+      const body = document.getElementById("meter-modal-body");
+      if (modal.hidden || meterDetailKind !== kind) return;
+
+      if (meterDetailAbort) {{
+        meterDetailAbort.abort();
+      }}
+      const ctrl = new AbortController();
+      meterDetailAbort = ctrl;
+
+      try {{
+        const res = await fetch("/api/meters/" + encodeURIComponent(kind), {{
+          cache: "no-store",
+          signal: ctrl.signal,
+        }});
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        const data = await res.json();
+        if (ctrl.signal.aborted || modal.hidden || meterDetailKind !== kind) return;
+        body.innerHTML = renderMeterDetail(data);
+      }} catch (e) {{
+        if (e && e.name === "AbortError") return;
+        if (initial) {{
+          body.innerHTML = `<div class="meter-detail-error">Falha ao carregar: ${{esc(e && e.message ? e.message : e)}}</div>`;
+        }}
+      }} finally {{
+        if (meterDetailAbort === ctrl) meterDetailAbort = null;
+      }}
+    }}
+
+    function closeMeterDetail() {{
+      meterDetailKind = null;
+      stopMeterDetailRefresh();
+      if (meterDetailAbort) {{
+        meterDetailAbort.abort();
+        meterDetailAbort = null;
+      }}
+      document.getElementById("meter-modal").hidden = true;
+      if (document.getElementById("settings-modal").hidden && document.getElementById("logs-modal").hidden) {{
+        document.body.style.overflow = "";
+      }}
+    }}
+
+    function getMeterDetailNav() {{
+      return DATA.meters
+        .filter((m) => m.detailKey)
+        .map((m) => ({{ kind: m.detailKey, label: m.label }}));
+    }}
+
+    function navigateMeterDetail(delta) {{
+      if (!meterDetailKind) return;
+      const nav = getMeterDetailNav();
+      const idx = nav.findIndex((item) => item.kind === meterDetailKind);
+      if (idx < 0) return;
+      const next = nav[(idx + delta + nav.length) % nav.length];
+      openMeterDetail(next.kind, next.label);
+    }}
+
+    async function openMeterDetail(kind, label) {{
+      if (meterDetailAbort) {{
+        meterDetailAbort.abort();
+        meterDetailAbort = null;
+      }}
+      stopMeterDetailRefresh();
+      meterDetailKind = kind;
+
+      const modal = document.getElementById("meter-modal");
+      const body = document.getElementById("meter-modal-body");
+      document.getElementById("meter-modal-title").textContent = label;
+      body.innerHTML = `<div class="meter-detail-loading">Carregando…</div>`;
+      modal.hidden = false;
+      document.body.style.overflow = "hidden";
+
+      await loadMeterDetail(kind, {{ initial: true }});
+      if (meterDetailKind === kind) startMeterDetailRefresh(kind);
+    }}
+
     function renderMeter(m) {{
       if (m.type === "storage") {{
         const bars = [renderStorageBar(m.main)]
@@ -1992,6 +3125,7 @@ def render_page(req_host: str) -> str:
           .join("");
         return `
           <div class="meter storage">
+            ${{renderMeterExpandBtn(m)}}
             <div class="meter-top">
               <span class="meter-label">${{esc(m.label)}}</span>
               ${{m.showSub ? `<span class="meter-sub">${{esc(m.sub)}}</span>` : ""}}
@@ -2004,6 +3138,7 @@ def render_page(req_host: str) -> str:
 
       return `
         <div class="meter">
+          ${{renderMeterExpandBtn(m)}}
           <div class="meter-top">
             <span class="meter-label">${{esc(m.label)}}</span>
             ${{m.showSub ? `<span class="meter-sub">${{esc(m.sub)}}</span>` : ""}}
@@ -2033,7 +3168,7 @@ def render_page(req_host: str) -> str:
     }}
 
     const CHART_HISTORY_MAX = 60;
-    const usageHistory = {{ cpu: [], ram: [] }};
+    const usageHistory = {{ cpu: [], ram: [], temp: [] }};
 
     function recordUsageSamples() {{
       for (const m of DATA.meters) {{
@@ -2322,7 +3457,7 @@ def render_page(req_host: str) -> str:
       document.getElementById("logs-progress").hidden = true;
       document.getElementById("logs-progress-bar").style.width = "0%";
       document.getElementById("logs-modal").hidden = true;
-      if (document.getElementById("settings-modal").hidden) {{
+      if (document.getElementById("settings-modal").hidden && document.getElementById("meter-modal").hidden) {{
         document.body.style.overflow = "";
       }}
     }}
@@ -2425,6 +3560,16 @@ def render_page(req_host: str) -> str:
       }}, 1600);
     }}
 
+    function clearLogs() {{
+      const view = document.getElementById("logs-view");
+      if (!view.textContent) return;
+      view.textContent = "";
+      logsStickBottom = true;
+      document.getElementById("logs-progress").hidden = true;
+      document.getElementById("logs-progress-bar").style.width = "0%";
+      document.getElementById("logs-scroll").scrollTop = 0;
+    }}
+
     document.getElementById("q").addEventListener("input", (e) => {{
       state.query = e.target.value;
       render();
@@ -2432,6 +3577,14 @@ def render_page(req_host: str) -> str:
 
     document.querySelectorAll(".sort-btn").forEach((btn) => {{
       btn.addEventListener("click", () => toggleSort(btn.dataset.key));
+    }});
+
+    document.getElementById("meters").addEventListener("click", (e) => {{
+      const expand = e.target.closest("[data-meter-detail]");
+      if (expand) {{
+        openMeterDetail(expand.dataset.meterDetail, expand.dataset.meterLabel || expand.dataset.meterDetail);
+        return;
+      }}
     }});
 
     document.getElementById("meters").addEventListener("pointerover", (e) => {{
@@ -2499,8 +3652,16 @@ def render_page(req_host: str) -> str:
       if (e.target.id === "settings-modal") closeSettings();
     }});
 
+    document.getElementById("meter-close").addEventListener("click", closeMeterDetail);
+    document.getElementById("meter-prev").addEventListener("click", () => navigateMeterDetail(-1));
+    document.getElementById("meter-next").addEventListener("click", () => navigateMeterDetail(1));
+    document.getElementById("meter-modal").addEventListener("click", (e) => {{
+      if (e.target.id === "meter-modal") closeMeterDetail();
+    }});
+
     document.getElementById("logs-close").addEventListener("click", closeLogs);
     document.getElementById("logs-copy").addEventListener("click", copyLogs);
+    document.getElementById("logs-clear").addEventListener("click", clearLogs);
     document.getElementById("logs-modal").addEventListener("click", (e) => {{
       if (e.target.id === "logs-modal") closeLogs();
     }});
@@ -2508,19 +3669,30 @@ def render_page(req_host: str) -> str:
     document.addEventListener("keydown", (e) => {{
       if (e.key !== "Escape") return;
       if (!document.getElementById("settings-modal").hidden) closeSettings();
+      else if (!document.getElementById("meter-modal").hidden) closeMeterDetail();
       else if (!document.getElementById("logs-modal").hidden) closeLogs();
     }});
 
     document.addEventListener("visibilitychange", () => {{
-      if (!document.hidden) refresh();
+      if (document.hidden) return;
+      refresh();
+      if (meterDetailKind === "cpu" && !document.getElementById("meter-modal").hidden) {{
+        loadMeterDetail("cpu");
+      }}
     }});
 
-    applySettings();
-    setClock();
-    renderMeters();
-    recordUsageSamples();
-    render();
-    setInterval(refresh, REFRESH_MS);
+    loadPrefs().then(() => {{
+      applySettings();
+      setClock();
+      renderMeters();
+      recordUsageSamples();
+      render();
+      setInterval(refresh, REFRESH_MS);
+    }}).catch((e) => {{
+      const err = document.getElementById("error");
+      err.hidden = false;
+      err.textContent = "Falha ao carregar preferências: " + (e && e.message ? e.message : e);
+    }});
   </script>
 </body>
 </html>
@@ -2530,11 +3702,38 @@ def render_page(req_host: str) -> str:
 class Handler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
+    def _send_json(self, payload: dict, status: int = 200) -> None:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _read_json_body(self) -> dict:
+        length = int(self.headers.get("Content-Length", 0))
+        if length <= 0:
+            return {}
+        raw = self.rfile.read(length)
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError("JSON inválido") from exc
+        if not isinstance(data, dict):
+            raise ValueError("Corpo deve ser um objeto JSON")
+        return data
+
     def do_GET(self) -> None:  # noqa: N802
         reload_if_stale()
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         host = request_host(self)
+
+        if path == "/api/prefs":
+            self._send_json(get_prefs())
+            return
 
         if path == "/api/status":
             body = json.dumps(page_payload(host), ensure_ascii=False).encode("utf-8")
@@ -2552,6 +3751,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._stream_logs(ref)
             return
 
+        if path.startswith("/api/meters/"):
+            kind = urllib.parse.unquote(path[len("/api/meters/") :]).strip("/")
+            try:
+                payload = meter_detail_payload(kind)
+                status = 200
+            except ValueError as exc:
+                payload = {"kind": kind, "error": str(exc)}
+                status = 400
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
         if path not in {"/", "/index.html"}:
             self.send_error(404, "Not Found")
             return
@@ -2564,6 +3781,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(body)
+
+    def do_PUT(self) -> None:  # noqa: N802
+        reload_if_stale()
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path != "/api/prefs":
+            self.send_error(404, "Not Found")
+            return
+        try:
+            data = self._read_json_body()
+            self._send_json(update_prefs(data))
+        except ValueError as exc:
+            self._send_json({"error": str(exc)}, status=400)
 
     def _stream_logs(self, ref: str) -> None:
         conn = None
@@ -2615,6 +3844,11 @@ class ReusableTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
 
 
 def main() -> None:
+    init_db()
+    cache = get_metrics_cache()
+    cache.warm()
+    cache.start()
+
     try:
         httpd = ReusableTCPServer((HOST, PORT), Handler)
     except PermissionError:

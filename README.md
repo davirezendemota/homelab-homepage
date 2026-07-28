@@ -75,6 +75,7 @@ A forma mais simples de subir o painel é via Docker Compose, montando o socket 
 | `PORT` | `8000` | Porta interna do container |
 | `DOCKER_SOCKET` | `/var/run/docker.sock` | Socket da API Docker |
 | `HOST_ROOT` | `/host` | Raiz do host montada para leitura de disco |
+| `DB_PATH` | `/app/data/homepage.db` | Caminho do banco SQLite de preferências |
 | `TZ` | — | Fuso horário (ex.: `America/Sao_Paulo`) |
 
 ## Usage
@@ -82,7 +83,7 @@ A forma mais simples de subir o painel é via Docker Compose, montando o socket 
 O dashboard carrega automaticamente os containers ativos. Use a barra de busca para filtrar por nome, imagem ou stack.
 
 - **Favoritos** — estrela ao lado do container; favoritos aparecem no topo
-- **Ocultar** — esconda stacks ou containers individuais (preferências salvas no navegador)
+- **Ocultar** — esconda stacks ou containers individuais (preferências salvas no SQLite)
 - **Logs** — botão de terminal abre modal com stream ao vivo (`/api/logs/<container>`)
 - **Portas** — clique nos badges de porta para abrir o serviço no host
 
@@ -91,6 +92,8 @@ Durante desenvolvimento, `app.py` está montado como volume: salvar o arquivo re
 **API**
 
 - `GET /api/status` — JSON com containers e métricas
+- `GET /api/prefs` — preferências (favoritos, ocultos, configurações)
+- `PUT /api/prefs` — atualiza preferências (corpo JSON parcial)
 - `GET /api/logs/<ref>` — stream de logs (stdout + stderr)
 
 ## Roadmap

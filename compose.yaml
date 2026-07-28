@@ -11,9 +11,11 @@ services:
       PORT: "8000"
       DOCKER_SOCKET: /var/run/docker.sock
       HOST_ROOT: /host
+      DB_PATH: /app/data/homepage.db
     volumes:
       # Monta o código local — editar app.py recarrega sem rebuild
       - ./app.py:/app/app.py:ro
+      - ./data:/app/data
       - /var/run/docker.sock:/var/run/docker.sock:ro
       # Raiz do host para ler mounts e uso de disco reais
       - /:/host:ro,rslave
