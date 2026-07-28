@@ -1363,6 +1363,9 @@ def render_page(req_host: str) -> str:
       height: 16px;
       display: block;
     }}
+    .header-settings-btn svg[hidden] {{
+      display: none;
+    }}
     .clock-dot {{
       width: 6px;
       height: 6px;
@@ -2361,6 +2364,10 @@ def render_page(req_host: str) -> str:
         <div class="clock">
           <span class="clock-dot"></span>
           Atualizado <span id="clock"></span>
+          <button type="button" class="header-settings-btn" id="fullscreen-toggle" title="Tela cheia" aria-label="Tela cheia">
+            <svg class="fullscreen-enter-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/></svg>
+            <svg class="fullscreen-exit-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" hidden><path d="M8 3v3a2 2 0 0 1-2 2H3m18 0h-3a2 2 0 0 1-2-2V3m0 18v-3a2 2 0 0 1 2-2h3M3 16h3a2 2 0 0 1 2 2v3"/></svg>
+          </button>
           <button type="button" class="header-settings-btn" id="settings-open" title="Configurações" aria-label="Abrir configurações">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6"/><path d="m19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9c.26.604.852.997 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1"/></svg>
           </button>
@@ -2725,6 +2732,30 @@ def render_page(req_host: str) -> str:
       if (document.getElementById("logs-modal").hidden && document.getElementById("meter-modal").hidden) {{
         document.body.style.overflow = "";
       }}
+    }}
+
+    function isFullscreen() {{
+      return Boolean(document.fullscreenElement);
+    }}
+
+    function toggleFullscreen() {{
+      if (isFullscreen()) {{
+        document.exitFullscreen();
+      }} else {{
+        document.documentElement.requestFullscreen();
+      }}
+    }}
+
+    function updateFullscreenButton() {{
+      const btn = document.getElementById("fullscreen-toggle");
+      if (!btn) return;
+      const fullscreen = isFullscreen();
+      btn.title = fullscreen ? "Sair da tela cheia" : "Tela cheia";
+      btn.setAttribute("aria-label", fullscreen ? "Sair da tela cheia" : "Tela cheia");
+      const enterIcon = btn.querySelector(".fullscreen-enter-icon");
+      const exitIcon = btn.querySelector(".fullscreen-exit-icon");
+      if (enterIcon) enterIcon.hidden = fullscreen;
+      if (exitIcon) exitIcon.hidden = !fullscreen;
     }}
 
     function setCompactView(enabled) {{
@@ -3639,6 +3670,14 @@ def render_page(req_host: str) -> str:
     document.getElementById("hidden-stacks").addEventListener("click", handleStacksClick);
 
     document.getElementById("hidden-toggle").addEventListener("click", toggleShowHidden);
+
+    const fullscreenToggle = document.getElementById("fullscreen-toggle");
+    if (document.fullscreenEnabled && fullscreenToggle) {{
+      fullscreenToggle.addEventListener("click", toggleFullscreen);
+      document.addEventListener("fullscreenchange", updateFullscreenButton);
+    }} else if (fullscreenToggle) {{
+      fullscreenToggle.hidden = true;
+    }}
 
     document.getElementById("settings-open").addEventListener("click", openSettings);
     document.getElementById("settings-close").addEventListener("click", closeSettings);
