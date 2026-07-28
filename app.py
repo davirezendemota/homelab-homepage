@@ -77,6 +77,42 @@ def docker_get(path: str):
         conn.close()
 
 
+def docker_request(method: str, path: str, body: bytes | None = None) -> None:
+    conn = UnixHTTPConnection(DOCKER_SOCKET)
+    try:
+        conn.request(method, path, body=body)
+        resp = conn.getresponse()
+        data = resp.read()
+        if resp.status >= 400:
+            raise RuntimeError(f"Docker API {resp.status}: {data.decode(errors='replace')}")
+    finally:
+        conn.close()
+
+
+def validate_container_ref(ref: str) -> str:
+    if not SAFE_CONTAINER_REF.match(ref):
+        raise ValueError("Referência de container inválida")
+    return urllib.parse.quote(ref, safe="")
+
+
+def container_start(ref: str) -> None:
+    docker_request("POST", f"/containers/{validate_container_ref(ref)}/start")
+
+
+def container_stop(ref: str) -> None:
+    docker_request("POST", f"/containers/{validate_container_ref(ref)}/stop")
+
+
+def container_restart(ref: str) -> None:
+    docker_request("POST", f"/containers/{validate_container_ref(ref)}/restart")
+
+
+def container_remove(ref: str, *, force: bool = False) -> None:
+    quoted = validate_container_ref(ref)
+    suffix = "?force=true" if force else ""
+    docker_request("DELETE", f"/containers/{quoted}{suffix}")
+
+
 def docker_open(path: str, timeout: float | None = 5.0):
     conn = UnixHTTPConnection(DOCKER_SOCKET, timeout=timeout)
     conn.request("GET", path)
@@ -1741,7 +1777,7 @@ def render_page(req_host: str) -> str:
     }}
     .row {{
       display: grid;
-      grid-template-columns: minmax(0, 1.5fr) minmax(0, 0.9fr) minmax(0, 0.85fr) minmax(0, 0.7fr) 72px;
+      grid-template-columns: minmax(0, 1.5fr) minmax(0, 0.9fr) 110px 150px minmax(0, 0.7fr) 72px;
       align-items: center;
       gap: 12px;
       padding: 14px 20px;
@@ -1769,10 +1805,52 @@ def render_page(req_host: str) -> str:
       font-weight: 600;
       white-space: nowrap;
       overflow: visible;
+      min-width: 0;
     }}
     body.truncate-names .name-text {{
       overflow: hidden;
       text-overflow: ellipsis;
+    }}
+    .container-actions {{
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 1px;
+      flex-shrink: 0;
+    }}
+    .name-action-btn {{
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 26px;
+      height: 26px;
+      padding: 0;
+      color: #6b7280;
+      background: transparent;
+      border: 1px solid transparent;
+      border-radius: 6px;
+      cursor: pointer;
+      opacity: 0.45;
+      transition: opacity .12s, color .12s, background .12s, border-color .12s;
+    }}
+    .row:hover .name-action-btn,
+    .name-action-btn:focus-visible {{
+      opacity: 1;
+    }}
+    .name-action-btn:hover {{
+      color: #e6e9ef;
+      background: #1a2230;
+      border-color: #2a3544;
+    }}
+    .name-action-btn.delete-btn:hover {{
+      color: #f85149;
+      background: rgba(248,81,73,.12);
+      border-color: rgba(248,81,73,.25);
+    }}
+    .name-action-btn svg {{
+      width: 14px;
+      height: 14px;
+      display: block;
     }}
     .image-text {{
       font-family: 'JetBrains Mono', monospace;
@@ -1781,10 +1859,12 @@ def render_page(req_host: str) -> str:
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
+      text-align: start;
     }}
     .status-cell {{
       display: flex;
       align-items: center;
+      justify-content: center;
       gap: 8px;
       flex-wrap: wrap;
     }}
@@ -2283,7 +2363,7 @@ def render_page(req_host: str) -> str:
       border-radius: 8px;
     }}
     body.compact-view .row {{
-      grid-template-columns: minmax(0, 1.4fr) minmax(0, 0.85fr) minmax(0, 0.8fr) minmax(0, 0.65fr) 60px;
+      grid-template-columns: minmax(0, 1.4fr) minmax(0, 0.85fr) 110px 150px minmax(0, 0.65fr) 60px;
     }}
     body.compact-view .status-dot {{
       width: 7px;
@@ -2295,6 +2375,15 @@ def render_page(req_host: str) -> str:
     }}
     body.compact-view .name-text {{
       font-size: 12.5px;
+    }}
+    body.compact-view .name-action-btn {{
+      width: 22px;
+      height: 22px;
+      border-radius: 5px;
+    }}
+    body.compact-view .name-action-btn svg {{
+      width: 12px;
+      height: 12px;
     }}
     body.compact-view .image-text {{
       font-size: 11px;
@@ -2328,11 +2417,12 @@ def render_page(req_host: str) -> str:
       .page {{ padding: 28px 20px 48px; }}
       .meters {{ grid-template-columns: repeat(2, 1fr); }}
       .row {{
-        grid-template-columns: 1fr auto;
+        grid-template-columns: minmax(0, 1fr) auto auto;
         gap: 10px;
       }}
       .row-name {{ grid-column: 1; }}
-      .row-actions {{ grid-column: 2; grid-row: 1; }}
+      .container-actions {{ grid-column: 2; }}
+      .row-actions {{ grid-column: 3; grid-row: 1; }}
       .image-text,
       .status-cell,
       .ports {{ grid-column: 1 / -1; }}
@@ -2494,6 +2584,10 @@ def render_page(req_host: str) -> str:
     const CHEVRON_DOWN = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>`;
     const CHEVRON_UP = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m18 15-6-6-6 6"/></svg>`;
     const EXPAND_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 3h6v6"/><path d="m21 3-7 7"/><path d="M9 21H3v-6"/><path d="m3 21 7-7"/></svg>`;
+    const PLAY_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polygon points="6 4 20 12 6 20 6 4"/></svg>`;
+    const STOP_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="1"/></svg>`;
+    const RESTART_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>`;
+    const TRASH_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>`;
 
     let favorites = new Set();
     let hiddenContainers = new Set();
@@ -3274,8 +3368,16 @@ def render_page(req_host: str) -> str:
       el.innerHTML = DATA.meters.map(renderMeter).join("");
     }}
 
+    function isContainerRunning(status) {{
+      return (status || "").toLowerCase().startsWith("up");
+    }}
+
     function renderContainerRow(c) {{
       const hidden = isHidden(c.name);
+      const running = isContainerRunning(c.status);
+      const lifecycleBtn = running
+        ? `<button type="button" class="name-action-btn" data-action="stop" data-id="${{esc(c.id)}}" data-name="${{esc(c.name)}}" title="Parar" aria-label="Parar ${{esc(c.name)}}">${{STOP_ICON}}</button>`
+        : `<button type="button" class="name-action-btn" data-action="start" data-id="${{esc(c.id)}}" data-name="${{esc(c.name)}}" title="Iniciar" aria-label="Iniciar ${{esc(c.name)}}">${{PLAY_ICON}}</button>`;
       return `
         <div class="row">
           <div class="row-name">
@@ -3285,6 +3387,11 @@ def render_page(req_host: str) -> str:
           <div class="image-text" title="${{esc(c.image)}}">${{esc(c.image)}}</div>
           <div class="status-cell">
             <span class="status-pill" style="color:${{c.statusColor}};background:${{c.statusBg}}">${{esc(c.status)}}</span>
+          </div>
+          <div class="container-actions">
+            ${{lifecycleBtn}}
+            <button type="button" class="name-action-btn" data-action="restart" data-id="${{esc(c.id)}}" data-name="${{esc(c.name)}}" title="Reiniciar" aria-label="Reiniciar ${{esc(c.name)}}">${{RESTART_ICON}}</button>
+            <button type="button" class="name-action-btn delete-btn" data-action="delete" data-id="${{esc(c.id)}}" data-name="${{esc(c.name)}}" title="Apagar" aria-label="Apagar ${{esc(c.name)}}">${{TRASH_ICON}}</button>
           </div>
           <div class="ports">
             ${{c.noPorts
@@ -3640,7 +3747,33 @@ def render_page(req_host: str) -> str:
       hideStorageTooltip();
     }});
 
+    async function containerAction(id, name, action) {{
+      if (action === "delete") {{
+        if (!confirm(`Apagar o container "${{name}}"? Esta ação não pode ser desfeita.`)) return;
+      }}
+      const url = action === "delete"
+        ? `/api/containers/${{encodeURIComponent(id)}}`
+        : `/api/containers/${{encodeURIComponent(id)}}/${{action}}`;
+      try {{
+        const res = await fetch(url, {{
+          method: action === "delete" ? "DELETE" : "POST",
+          cache: "no-store",
+        }});
+        const data = await res.json().catch(() => ({{}}));
+        if (!res.ok) throw new Error(data.error || "HTTP " + res.status);
+        refreshing = false;
+        await refresh();
+      }} catch (err) {{
+        alert("Falha ao executar ação: " + (err && err.message ? err.message : err));
+      }}
+    }}
+
     function handleStacksClick(e) {{
+      const actionBtn = e.target.closest("[data-action]");
+      if (actionBtn) {{
+        containerAction(actionBtn.dataset.id, actionBtn.dataset.name, actionBtn.dataset.action);
+        return;
+      }}
       const fav = e.target.closest("[data-fav]");
       if (fav) {{
         toggleFavorite(fav.dataset.fav);
@@ -3832,6 +3965,54 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send_json(update_prefs(data))
         except ValueError as exc:
             self._send_json({"error": str(exc)}, status=400)
+
+    def _handle_container_action(self, ref: str, action: str) -> None:
+        try:
+            if action == "start":
+                container_start(ref)
+            elif action == "stop":
+                container_stop(ref)
+            elif action == "restart":
+                container_restart(ref)
+            else:
+                self.send_error(404, "Not Found")
+                return
+            self._send_json({"ok": True})
+        except ValueError as exc:
+            self._send_json({"error": str(exc)}, status=400)
+        except RuntimeError as exc:
+            self._send_json({"error": str(exc)}, status=502)
+
+    def do_POST(self) -> None:  # noqa: N802
+        reload_if_stale()
+        parsed = urllib.parse.urlparse(self.path)
+        match = re.fullmatch(r"/api/containers/([^/]+)/(start|stop|restart)", parsed.path)
+        if not match:
+            self.send_error(404, "Not Found")
+            return
+        ref = urllib.parse.unquote(match.group(1))
+        self._handle_container_action(ref, match.group(2))
+
+    def do_DELETE(self) -> None:  # noqa: N802
+        reload_if_stale()
+        parsed = urllib.parse.urlparse(self.path)
+        match = re.fullmatch(r"/api/containers/([^/]+)", parsed.path)
+        if not match:
+            self.send_error(404, "Not Found")
+            return
+        ref = urllib.parse.unquote(match.group(1))
+        force = urllib.parse.parse_qs(parsed.query).get("force", ["true"])[0].lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+        try:
+            container_remove(ref, force=force)
+            self._send_json({"ok": True})
+        except ValueError as exc:
+            self._send_json({"error": str(exc)}, status=400)
+        except RuntimeError as exc:
+            self._send_json({"error": str(exc)}, status=502)
 
     def _stream_logs(self, ref: str) -> None:
         conn = None
