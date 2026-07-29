@@ -2095,6 +2095,54 @@ def render_page(req_host: str) -> str:
       margin-bottom: 24px;
       font-size: 14px;
     }}
+    .toast-container {{
+      position: fixed;
+      bottom: 20px;
+      right: 20px;
+      z-index: 60;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      max-width: min(420px, calc(100vw - 40px));
+      pointer-events: none;
+    }}
+    .toast {{
+      padding: 12px 16px;
+      border-radius: 10px;
+      font-size: 13.5px;
+      line-height: 1.4;
+      color: #e6e9ef;
+      background: #1a2030;
+      border: 1px solid #2a3544;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, .35);
+      opacity: 0;
+      transform: translateY(8px);
+      transition: opacity .2s ease, transform .2s ease;
+      pointer-events: auto;
+    }}
+    .toast.toast-visible {{
+      opacity: 1;
+      transform: translateY(0);
+    }}
+    .toast.toast-hiding {{
+      opacity: 0;
+      transform: translateY(8px);
+    }}
+    .toast-info {{
+      border-color: rgba(108, 182, 255, .35);
+      background: rgba(108, 182, 255, .1);
+      color: #c9e4ff;
+    }}
+    .toast-success {{
+      border-color: rgba(63, 185, 80, .35);
+      background: rgba(63, 185, 80, .1);
+      color: #b8f0c4;
+    }}
+    .toast-error {{
+      border-color: rgba(248, 81, 73, .35);
+      background: rgba(248, 81, 73, .1);
+      color: #ffb4ae;
+    }}
     .modal-backdrop {{
       position: fixed;
       inset: 0;
@@ -2598,6 +2646,7 @@ def render_page(req_host: str) -> str:
   </div>
 
   <div id="storage-tooltip" class="storage-tooltip" hidden></div>
+  <div id="toast-container" class="toast-container" aria-live="polite" aria-atomic="true"></div>
 
   <div id="settings-modal" class="modal-backdrop" hidden>
     <div class="modal modal-sm" role="dialog" aria-modal="true" aria-labelledby="settings-modal-title">
@@ -2694,6 +2743,13 @@ def render_page(req_host: str) -> str:
     const STOP_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="1"/></svg>`;
     const RESTART_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>`;
     const TRASH_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>`;
+
+    const ACTION_LABELS = {{
+      start: {{ verb: "Iniciando", done: "iniciado", stackDone: "iniciada" }},
+      stop: {{ verb: "Parando", done: "parado", stackDone: "parada" }},
+      restart: {{ verb: "Reiniciando", done: "reiniciado", stackDone: "reiniciada" }},
+      delete: {{ verb: "Apagando", done: "apagado", stackDone: "apagada" }},
+    }};
 
     let favorites = new Set();
     let hiddenContainers = new Set();
@@ -3875,10 +3931,65 @@ def render_page(req_host: str) -> str:
       hideStorageTooltip();
     }});
 
+    function actionStartMessage(action, name, isStack) {{
+      const labels = ACTION_LABELS[action];
+      if (!labels) return `Executando ${{action}}…`;
+      return isStack
+        ? `${{labels.verb}} stack "${{name}}"…`
+        : `${{labels.verb}} container "${{name}}"…`;
+    }}
+
+    function actionSuccessMessage(action, name, isStack) {{
+      const labels = ACTION_LABELS[action];
+      if (!labels) return "Ação concluída.";
+      const done = isStack ? labels.stackDone : labels.done;
+      return isStack
+        ? `Stack "${{name}}" ${{done}}.`
+        : `Container "${{name}}" ${{done}}.`;
+    }}
+
+    function showToast(message, type = "info", duration = 4500) {{
+      const container = document.getElementById("toast-container");
+      const toast = document.createElement("div");
+      toast.className = `toast toast-${{type}}`;
+      toast.textContent = message;
+      container.appendChild(toast);
+      requestAnimationFrame(() => toast.classList.add("toast-visible"));
+      let removed = false;
+      const remove = () => {{
+        if (removed) return;
+        removed = true;
+        toast.classList.remove("toast-visible");
+        toast.classList.add("toast-hiding");
+        const cleanup = () => toast.remove();
+        toast.addEventListener("transitionend", cleanup, {{ once: true }});
+        setTimeout(cleanup, 250);
+      }};
+      let timer = duration > 0 ? setTimeout(remove, duration) : null;
+      return {{
+        update(newMessage, newType = type, newDuration = duration) {{
+          toast.textContent = newMessage;
+          toast.className = `toast toast-${{newType}} toast-visible`;
+          if (timer) clearTimeout(timer);
+          timer = newDuration > 0 ? setTimeout(remove, newDuration) : null;
+        }},
+        remove,
+      }};
+    }}
+
+    function formatActionError(err) {{
+      const msg = err && err.message ? err.message : String(err);
+      if (msg === "Failed to fetch" || msg === "NetworkError when attempting to fetch resource.") {{
+        return "Conexão perdida com o servidor (operação demorou demais ou o serviço reiniciou).";
+      }}
+      return msg;
+    }}
+
     async function containerAction(id, name, action) {{
       if (action === "delete") {{
         if (!confirm(`Apagar o container "${{name}}"? Esta ação não pode ser desfeita.`)) return;
       }}
+      const toast = showToast(actionStartMessage(action, name, false), "info", 0);
       const url = action === "delete"
         ? `/api/containers/${{encodeURIComponent(id)}}`
         : `/api/containers/${{encodeURIComponent(id)}}/${{action}}`;
@@ -3889,10 +4000,16 @@ def render_page(req_host: str) -> str:
         }});
         const data = await res.json().catch(() => ({{}}));
         if (!res.ok) throw new Error(data.error || "HTTP " + res.status);
+        toast.update(actionSuccessMessage(action, name, false), "success");
         refreshing = false;
         await refresh();
       }} catch (err) {{
-        alert("Falha ao executar ação: " + (err && err.message ? err.message : err));
+        toast.remove();
+        showToast(
+          "Falha ao executar ação: " + formatActionError(err),
+          "error",
+          6000,
+        );
       }}
     }}
 
@@ -3900,6 +4017,7 @@ def render_page(req_host: str) -> str:
       if (action === "delete") {{
         if (!confirm(`Apagar todos os containers da stack "${{stackName}}"? Esta ação não pode ser desfeita.`)) return;
       }}
+      const toast = showToast(actionStartMessage(action, stackName, true), "info", 0);
       const enc = encodeURIComponent(stackName);
       const url = action === "delete"
         ? `/api/stacks/${{enc}}`
@@ -3911,10 +4029,16 @@ def render_page(req_host: str) -> str:
         }});
         const data = await res.json().catch(() => ({{}}));
         if (!res.ok) throw new Error(data.error || "HTTP " + res.status);
+        toast.update(actionSuccessMessage(action, stackName, true), "success");
         refreshing = false;
         await refresh();
       }} catch (err) {{
-        alert("Falha ao executar ação na stack: " + (err && err.message ? err.message : err));
+        toast.remove();
+        showToast(
+          "Falha na stack: " + formatActionError(err),
+          "error",
+          6000,
+        );
       }}
     }}
 
