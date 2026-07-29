@@ -17,7 +17,7 @@ import sys
 import threading
 import time
 import urllib.parse
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import deepcopy
 
@@ -77,8 +77,17 @@ def docker_get(path: str):
         conn.close()
 
 
-def docker_request(method: str, path: str, body: bytes | None = None) -> None:
-    conn = UnixHTTPConnection(DOCKER_SOCKET)
+DOCKER_ACTION_TIMEOUT = 120.0
+
+
+def docker_request(
+    method: str,
+    path: str,
+    body: bytes | None = None,
+    *,
+    timeout: float | None = 5.0,
+) -> None:
+    conn = UnixHTTPConnection(DOCKER_SOCKET, timeout=timeout)
     try:
         conn.request(method, path, body=body)
         resp = conn.getresponse()
@@ -96,21 +105,40 @@ def validate_container_ref(ref: str) -> str:
 
 
 def container_start(ref: str) -> None:
-    docker_request("POST", f"/containers/{validate_container_ref(ref)}/start")
+    quoted = validate_container_ref(ref)
+    docker_request(
+        "POST",
+        f"/containers/{quoted}/start",
+        timeout=DOCKER_ACTION_TIMEOUT,
+    )
 
 
 def container_stop(ref: str) -> None:
-    docker_request("POST", f"/containers/{validate_container_ref(ref)}/stop")
+    quoted = validate_container_ref(ref)
+    docker_request(
+        "POST",
+        f"/containers/{quoted}/stop?t=30",
+        timeout=DOCKER_ACTION_TIMEOUT,
+    )
 
 
 def container_restart(ref: str) -> None:
-    docker_request("POST", f"/containers/{validate_container_ref(ref)}/restart")
+    quoted = validate_container_ref(ref)
+    docker_request(
+        "POST",
+        f"/containers/{quoted}/restart?t=30",
+        timeout=DOCKER_ACTION_TIMEOUT,
+    )
 
 
 def container_remove(ref: str, *, force: bool = False) -> None:
     quoted = validate_container_ref(ref)
     suffix = "?force=true" if force else ""
-    docker_request("DELETE", f"/containers/{quoted}{suffix}")
+    docker_request(
+        "DELETE",
+        f"/containers/{quoted}{suffix}",
+        timeout=DOCKER_ACTION_TIMEOUT,
+    )
 
 
 def validate_stack_name(name: str) -> str:
@@ -129,19 +157,38 @@ def is_container_running(status: str) -> bool:
 
 
 def stack_stop(stack: str) -> None:
-    for c in containers_in_stack(stack):
-        if is_container_running(c["status"]):
-            container_stop(c["id"])
+    targets = [
+        c for c in containers_in_stack(stack) if is_container_running(c["status"])
+    ]
+    _run_stack_container_actions(targets, container_stop)
 
 
 def stack_restart(stack: str) -> None:
-    for c in containers_in_stack(stack):
-        container_restart(c["id"])
+    targets = containers_in_stack(stack)
+    _run_stack_container_actions(targets, container_restart)
 
 
 def stack_remove(stack: str) -> None:
-    for c in containers_in_stack(stack):
-        container_remove(c["id"], force=True)
+    targets = containers_in_stack(stack)
+    _run_stack_container_actions(
+        targets,
+        lambda ref: container_remove(ref, force=True),
+    )
+
+
+def _run_stack_container_actions(
+    containers: list[dict],
+    action: Callable[[str], None],
+) -> None:
+    if not containers:
+        return
+    if len(containers) == 1:
+        action(containers[0]["id"])
+        return
+    with ThreadPoolExecutor(max_workers=min(len(containers), 8)) as pool:
+        futures = [pool.submit(action, c["id"]) for c in containers]
+        for future in as_completed(futures):
+            future.result()
 
 
 def docker_open(path: str, timeout: float | None = 5.0):
@@ -4088,6 +4135,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send_json({"ok": True})
         except ValueError as exc:
             self._send_json({"error": str(exc)}, status=400)
+        except (OSError, TimeoutError) as exc:
+            self._send_json({"error": f"Timeout ou falha na conexão com Docker: {exc}"}, status=502)
         except RuntimeError as exc:
             self._send_json({"error": str(exc)}, status=502)
 
@@ -4103,6 +4152,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send_json({"ok": True})
         except ValueError as exc:
             self._send_json({"error": str(exc)}, status=400)
+        except (OSError, TimeoutError) as exc:
+            self._send_json({"error": f"Timeout ou falha na conexão com Docker: {exc}"}, status=502)
         except RuntimeError as exc:
             self._send_json({"error": str(exc)}, status=502)
 
@@ -4132,6 +4183,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._send_json({"ok": True})
             except ValueError as exc:
                 self._send_json({"error": str(exc)}, status=400)
+            except (OSError, TimeoutError) as exc:
+                self._send_json(
+                    {"error": f"Timeout ou falha na conexão com Docker: {exc}"},
+                    status=502,
+                )
             except RuntimeError as exc:
                 self._send_json({"error": str(exc)}, status=502)
             return
@@ -4150,6 +4206,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send_json({"ok": True})
         except ValueError as exc:
             self._send_json({"error": str(exc)}, status=400)
+        except (OSError, TimeoutError) as exc:
+            self._send_json(
+                {"error": f"Timeout ou falha na conexão com Docker: {exc}"},
+                status=502,
+            )
         except RuntimeError as exc:
             self._send_json({"error": str(exc)}, status=502)
 
