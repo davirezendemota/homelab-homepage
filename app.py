@@ -113,6 +113,37 @@ def container_remove(ref: str, *, force: bool = False) -> None:
     docker_request("DELETE", f"/containers/{quoted}{suffix}")
 
 
+def validate_stack_name(name: str) -> str:
+    if not name or "/" in name or "\x00" in name:
+        raise ValueError("Nome de stack inválido")
+    return name
+
+
+def containers_in_stack(stack: str) -> list[dict]:
+    validate_stack_name(stack)
+    return [c for c in running_containers() if c["stack"] == stack]
+
+
+def is_container_running(status: str) -> bool:
+    return (status or "").lower().startswith("up")
+
+
+def stack_stop(stack: str) -> None:
+    for c in containers_in_stack(stack):
+        if is_container_running(c["status"]):
+            container_stop(c["id"])
+
+
+def stack_restart(stack: str) -> None:
+    for c in containers_in_stack(stack):
+        container_restart(c["id"])
+
+
+def stack_remove(stack: str) -> None:
+    for c in containers_in_stack(stack):
+        container_remove(c["id"], force=True)
+
+
 def docker_open(path: str, timeout: float | None = 5.0):
     conn = UnixHTTPConnection(DOCKER_SOCKET, timeout=timeout)
     conn.request("GET", path)
@@ -1718,15 +1749,29 @@ def render_page(req_host: str) -> str:
       padding: 0 4px;
     }}
     .stack-hide-btn,
-    .stack-collapse-btn {{
+    .stack-collapse-btn,
+    .stack-action-btn {{
       width: 28px;
       height: 28px;
       flex-shrink: 0;
     }}
     .stack-hide-btn svg,
-    .stack-collapse-btn svg {{
+    .stack-collapse-btn svg,
+    .stack-action-btn svg {{
       width: 14px;
       height: 14px;
+    }}
+    .stack-actions {{
+      display: inline-flex;
+      align-items: center;
+      gap: 1px;
+    }}
+    .stack-action-btn {{
+      opacity: 0.45;
+    }}
+    .stack-head:hover .stack-action-btn,
+    .stack-action-btn:focus-visible {{
+      opacity: 1;
     }}
     .stack-meta {{
       display: inline-flex;
@@ -3372,6 +3417,25 @@ def render_page(req_host: str) -> str:
       return (status || "").toLowerCase().startsWith("up");
     }}
 
+    function stackHasRunning(stack) {{
+      return stack.containers.some((c) => isContainerRunning(c.status));
+    }}
+
+    function renderStackActions(stack) {{
+      if (stack.isFavorites || !stack.showTitle) return "";
+      const running = stackHasRunning(stack);
+      const lifecycleBtn = running
+        ? `<button type="button" class="name-action-btn stack-action-btn" data-stack-action="stop" data-stack-name="${{esc(stack.name)}}" title="Parar stack" aria-label="Parar stack ${{esc(stack.name)}}">${{STOP_ICON}}</button>`
+        : "";
+      return `
+        <div class="stack-actions">
+          ${{lifecycleBtn}}
+          <button type="button" class="name-action-btn stack-action-btn" data-stack-action="restart" data-stack-name="${{esc(stack.name)}}" title="Reiniciar stack" aria-label="Reiniciar stack ${{esc(stack.name)}}">${{RESTART_ICON}}</button>
+          <button type="button" class="name-action-btn stack-action-btn delete-btn" data-stack-action="delete" data-stack-name="${{esc(stack.name)}}" title="Apagar stack" aria-label="Apagar stack ${{esc(stack.name)}}">${{TRASH_ICON}}</button>
+        </div>
+      `;
+    }}
+
     function renderContainerRow(c) {{
       const hidden = isHidden(c.name);
       const running = isContainerRunning(c.status);
@@ -3424,6 +3488,7 @@ def render_page(req_host: str) -> str:
             ${{showStackHide && !stack.isFavorites ? `
               <button type="button" class="hide-btn stack-hide-btn${{stackHidden ? " is-on" : ""}}" data-hide-stack="${{esc(stack.name)}}" title="${{stackHidden ? "Mostrar stack" : "Esconder stack"}}" aria-label="${{stackHidden ? "Mostrar stack " + esc(stack.name) : "Esconder stack " + esc(stack.name)}}" aria-pressed="${{stackHidden ? "true" : "false"}}">${{HIDE_ICON}}</button>
             ` : ""}}
+            ${{renderStackActions(stack)}}
           </div>
         </div>
       `;
@@ -3768,7 +3833,34 @@ def render_page(req_host: str) -> str:
       }}
     }}
 
+    async function stackAction(stackName, action) {{
+      if (action === "delete") {{
+        if (!confirm(`Apagar todos os containers da stack "${{stackName}}"? Esta ação não pode ser desfeita.`)) return;
+      }}
+      const enc = encodeURIComponent(stackName);
+      const url = action === "delete"
+        ? `/api/stacks/${{enc}}`
+        : `/api/stacks/${{enc}}/${{action}}`;
+      try {{
+        const res = await fetch(url, {{
+          method: action === "delete" ? "DELETE" : "POST",
+          cache: "no-store",
+        }});
+        const data = await res.json().catch(() => ({{}}));
+        if (!res.ok) throw new Error(data.error || "HTTP " + res.status);
+        refreshing = false;
+        await refresh();
+      }} catch (err) {{
+        alert("Falha ao executar ação na stack: " + (err && err.message ? err.message : err));
+      }}
+    }}
+
     function handleStacksClick(e) {{
+      const stackActionBtn = e.target.closest("[data-stack-action]");
+      if (stackActionBtn) {{
+        stackAction(stackActionBtn.dataset.stackName, stackActionBtn.dataset.stackAction);
+        return;
+      }}
       const actionBtn = e.target.closest("[data-action]");
       if (actionBtn) {{
         containerAction(actionBtn.dataset.id, actionBtn.dataset.name, actionBtn.dataset.action);
@@ -3983,9 +4075,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except RuntimeError as exc:
             self._send_json({"error": str(exc)}, status=502)
 
+    def _handle_stack_action(self, stack: str, action: str) -> None:
+        try:
+            if action == "stop":
+                stack_stop(stack)
+            elif action == "restart":
+                stack_restart(stack)
+            else:
+                self.send_error(404, "Not Found")
+                return
+            self._send_json({"ok": True})
+        except ValueError as exc:
+            self._send_json({"error": str(exc)}, status=400)
+        except RuntimeError as exc:
+            self._send_json({"error": str(exc)}, status=502)
+
     def do_POST(self) -> None:  # noqa: N802
         reload_if_stale()
         parsed = urllib.parse.urlparse(self.path)
+        stack_match = re.fullmatch(r"/api/stacks/([^/]+)/(stop|restart)", parsed.path)
+        if stack_match:
+            stack = urllib.parse.unquote(stack_match.group(1))
+            self._handle_stack_action(stack, stack_match.group(2))
+            return
         match = re.fullmatch(r"/api/containers/([^/]+)/(start|stop|restart)", parsed.path)
         if not match:
             self.send_error(404, "Not Found")
@@ -3996,6 +4108,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_DELETE(self) -> None:  # noqa: N802
         reload_if_stale()
         parsed = urllib.parse.urlparse(self.path)
+        stack_match = re.fullmatch(r"/api/stacks/([^/]+)", parsed.path)
+        if stack_match:
+            stack = urllib.parse.unquote(stack_match.group(1))
+            try:
+                stack_remove(stack)
+                self._send_json({"ok": True})
+            except ValueError as exc:
+                self._send_json({"error": str(exc)}, status=400)
+            except RuntimeError as exc:
+                self._send_json({"error": str(exc)}, status=502)
+            return
         match = re.fullmatch(r"/api/containers/([^/]+)", parsed.path)
         if not match:
             self.send_error(404, "Not Found")
