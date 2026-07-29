@@ -1764,12 +1764,21 @@ def render_page(req_host: str) -> str:
     .stack-actions {{
       display: inline-flex;
       align-items: center;
-      gap: 1px;
+    }}
+    .action-group {{
+      display: inline-flex;
+      align-items: center;
+      gap: 0;
+      padding: 2px;
+      background: #141922;
+      border: 1px solid #1e2530;
+      border-radius: 9999px;
+      flex-shrink: 0;
     }}
     .stack-action-btn {{
       opacity: 0.45;
     }}
-    .stack-head:hover .stack-action-btn,
+    .stack-head:hover .action-group .stack-action-btn,
     .stack-action-btn:focus-visible {{
       opacity: 1;
     }}
@@ -1860,8 +1869,11 @@ def render_page(req_host: str) -> str:
       display: flex;
       align-items: center;
       justify-content: center;
-      gap: 1px;
       flex-shrink: 0;
+    }}
+    .action-group .name-action-btn {{
+      border-radius: 9999px;
+      border-color: transparent;
     }}
     .name-action-btn {{
       display: inline-flex;
@@ -2424,7 +2436,9 @@ def render_page(req_host: str) -> str:
     body.compact-view .name-action-btn {{
       width: 22px;
       height: 22px;
-      border-radius: 5px;
+    }}
+    body.compact-view .action-group {{
+      padding: 1px;
     }}
     body.compact-view .name-action-btn svg {{
       width: 12px;
@@ -3428,7 +3442,7 @@ def render_page(req_host: str) -> str:
         ? `<button type="button" class="name-action-btn stack-action-btn" data-stack-action="stop" data-stack-name="${{esc(stack.name)}}" title="Parar stack" aria-label="Parar stack ${{esc(stack.name)}}">${{STOP_ICON}}</button>`
         : "";
       return `
-        <div class="stack-actions">
+        <div class="action-group stack-actions">
           ${{lifecycleBtn}}
           <button type="button" class="name-action-btn stack-action-btn" data-stack-action="restart" data-stack-name="${{esc(stack.name)}}" title="Reiniciar stack" aria-label="Reiniciar stack ${{esc(stack.name)}}">${{RESTART_ICON}}</button>
           <button type="button" class="name-action-btn stack-action-btn delete-btn" data-stack-action="delete" data-stack-name="${{esc(stack.name)}}" title="Apagar stack" aria-label="Apagar stack ${{esc(stack.name)}}">${{TRASH_ICON}}</button>
@@ -3453,9 +3467,11 @@ def render_page(req_host: str) -> str:
             <span class="status-pill" style="color:${{c.statusColor}};background:${{c.statusBg}}">${{esc(c.status)}}</span>
           </div>
           <div class="container-actions">
-            ${{lifecycleBtn}}
-            <button type="button" class="name-action-btn" data-action="restart" data-id="${{esc(c.id)}}" data-name="${{esc(c.name)}}" title="Reiniciar" aria-label="Reiniciar ${{esc(c.name)}}">${{RESTART_ICON}}</button>
-            <button type="button" class="name-action-btn delete-btn" data-action="delete" data-id="${{esc(c.id)}}" data-name="${{esc(c.name)}}" title="Apagar" aria-label="Apagar ${{esc(c.name)}}">${{TRASH_ICON}}</button>
+            <div class="action-group">
+              ${{lifecycleBtn}}
+              <button type="button" class="name-action-btn" data-action="restart" data-id="${{esc(c.id)}}" data-name="${{esc(c.name)}}" title="Reiniciar" aria-label="Reiniciar ${{esc(c.name)}}">${{RESTART_ICON}}</button>
+              <button type="button" class="name-action-btn delete-btn" data-action="delete" data-id="${{esc(c.id)}}" data-name="${{esc(c.name)}}" title="Apagar" aria-label="Apagar ${{esc(c.name)}}">${{TRASH_ICON}}</button>
+            </div>
           </div>
           <div class="ports">
             ${{c.noPorts
