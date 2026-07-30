@@ -2,3 +2,5 @@ __pycache__/
 *.pyc
 .env
 data/
+# Dev Workspace bridge (secrets local — install-kit)
+.dev-workspace/
