@@ -232,7 +232,7 @@ def parse_health(status: str) -> str | None:
 
 def running_containers() -> list[dict]:
     rows = []
-    for c in docker_get("/containers/json"):
+    for c in docker_get("/containers/json?all=1"):
         labels = c.get("Labels") or {}
         names = [n.lstrip("/") for n in (c.get("Names") or [])]
         cid = c.get("Id") or ""
@@ -636,6 +636,21 @@ def _meter_detail_cpu_from_stats(pairs: list[tuple[dict, dict]]) -> dict:
     return {"rows": rows, "total": 100}
 
 
+def _cpu_pct_by_name(pairs: list[tuple[dict, dict]]) -> dict[str, float]:
+    return {
+        _container_name(container): round(_container_cpu_pct(stats), 1)
+        for container, stats in pairs
+    }
+
+
+def _attach_cpu_pct(containers: list[dict], cpu_by_name: dict[str, float]) -> None:
+    for container in containers:
+        if is_container_running(container["status"]):
+            container["cpuPct"] = cpu_by_name.get(container["name"], 0.0)
+        else:
+            container["cpuPct"] = None
+
+
 def _meter_detail_ram_from_stats(pairs: list[tuple[dict, dict]]) -> dict:
     ram_pct, ram_used_gb, ram_total_gb = ram_stats()
     ram_total_bytes = int(ram_total_gb * (1024**3))
@@ -813,9 +828,20 @@ class MetricsCache:
         meters: list[dict] | None = None
         status_error: str | None = None
         meter_updates: dict[str, dict] = {}
+        cpu_by_name: dict[str, float] = {}
+
+        try:
+            stats_pairs = _running_container_stats()
+            cpu_by_name = _cpu_pct_by_name(stats_pairs)
+            meter_updates["cpu"] = _meter_detail_cpu_from_stats(stats_pairs)
+            meter_updates["ram"] = _meter_detail_ram_from_stats(stats_pairs)
+        except Exception as exc:  # noqa: BLE001
+            meter_updates["cpu"] = {"error": str(exc)}
+            meter_updates["ram"] = {"error": str(exc)}
 
         try:
             containers = running_containers()
+            _attach_cpu_pct(containers, cpu_by_name)
         except Exception as exc:  # noqa: BLE001
             status_error = str(exc)
 
@@ -829,14 +855,6 @@ class MetricsCache:
             meter_updates["temp"] = meter_detail_temp()
         except Exception as exc:  # noqa: BLE001
             meter_updates["temp"] = {"error": str(exc)}
-
-        try:
-            stats_pairs = _running_container_stats()
-            meter_updates["cpu"] = _meter_detail_cpu_from_stats(stats_pairs)
-            meter_updates["ram"] = _meter_detail_ram_from_stats(stats_pairs)
-        except Exception as exc:  # noqa: BLE001
-            meter_updates["cpu"] = {"error": str(exc)}
-            meter_updates["ram"] = {"error": str(exc)}
 
         with self._lock:
             if containers is not None:
@@ -1787,6 +1805,35 @@ def render_page(req_host: str) -> str:
       font-size: 10px;
       opacity: .85;
     }}
+    .hidden-show-toggle {{
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 34px;
+      height: 34px;
+      padding: 0;
+      color: #c9d1de;
+      background: #141922;
+      border: 1px solid #1e2530;
+      border-radius: 20px;
+      cursor: pointer;
+      transition: all .12s;
+      flex-shrink: 0;
+    }}
+    .hidden-show-toggle svg {{
+      width: 16px;
+      height: 16px;
+      display: block;
+    }}
+    .hidden-show-toggle.active {{
+      color: #0c0f14;
+      background: #e6e9ef;
+      border-color: #e6e9ef;
+    }}
+    .hidden-show-toggle:hover:not(.active) {{
+      border-color: #2a3544;
+      background: #1a2230;
+    }}
     .stack-block {{ margin-bottom: 44px; }}
     .stack-head {{
       display: flex;
@@ -1878,7 +1925,7 @@ def render_page(req_host: str) -> str:
     }}
     .row {{
       display: grid;
-      grid-template-columns: minmax(0, 1.5fr) minmax(0, 0.9fr) 110px 150px minmax(0, 0.7fr) 72px;
+      grid-template-columns: minmax(0, 1.5fr) 120px minmax(0, 0.9fr) 110px 150px minmax(0, 0.7fr) 72px;
       align-items: center;
       gap: 12px;
       padding: 14px 20px;
@@ -1889,6 +1936,13 @@ def render_page(req_host: str) -> str:
       transition: background .12s ease;
     }}
     .row:hover {{ background: #151b24; }}
+    .row.is-hidden {{
+      opacity: .42;
+      transition: opacity .12s ease, background .12s ease;
+    }}
+    .row.is-hidden:hover {{
+      opacity: .58;
+    }}
     .row-name {{
       display: flex;
       align-items: center;
@@ -1911,6 +1965,22 @@ def render_page(req_host: str) -> str:
     body.truncate-names .name-text {{
       overflow: hidden;
       text-overflow: ellipsis;
+    }}
+    .cpu-cell {{
+      min-width: 0;
+      padding: 0 12px;
+    }}
+    .cpu-bar {{
+      height: 6px;
+      background: #1a2030;
+      border-radius: 999px;
+      overflow: hidden;
+    }}
+    .cpu-bar > span {{
+      display: block;
+      height: 100%;
+      border-radius: 999px;
+      transition: width .35s ease, background-color .35s ease;
     }}
     .container-actions {{
       display: flex;
@@ -2058,27 +2128,6 @@ def render_page(req_host: str) -> str:
     .hide-btn.is-on svg {{
       fill: currentColor;
       stroke: currentColor;
-    }}
-    .hidden-toggle-wrap {{
-      margin-top: 4px;
-      text-align: center;
-    }}
-    .hidden-toggle {{
-      font-family: 'Inter', system-ui, sans-serif;
-      font-size: 13px;
-      font-weight: 500;
-      color: #8b94a3;
-      background: transparent;
-      border: 1px dashed #2a3544;
-      border-radius: 10px;
-      padding: 10px 16px;
-      cursor: pointer;
-      transition: color .12s, border-color .12s, background .12s;
-    }}
-    .hidden-toggle:hover {{
-      color: #c9d1de;
-      background: #11151d;
-      border-color: #3a4658;
     }}
     .empty {{
       text-align: center;
@@ -2514,8 +2563,25 @@ def render_page(req_host: str) -> str:
       gap: 8px;
       border-radius: 8px;
     }}
+    body.compact-view .flat-list {{
+      background: #11151d;
+      border: 1px solid #1c232e;
+      border-radius: 10px;
+      overflow: hidden;
+    }}
+    body.compact-view .flat-list .row {{
+      border: none;
+      border-radius: 0;
+      margin-bottom: 0;
+      padding: 6px 12px;
+      gap: 8px;
+      border-bottom: 1px solid #1a2030;
+    }}
+    body.compact-view .flat-list .row:last-child {{
+      border-bottom: none;
+    }}
     body.compact-view .row {{
-      grid-template-columns: minmax(0, 1.4fr) minmax(0, 0.85fr) 110px 150px minmax(0, 0.65fr) 60px;
+      grid-template-columns: minmax(0, 1.4fr) 96px minmax(0, 0.85fr) 110px 150px minmax(0, 0.65fr) 60px;
     }}
     body.compact-view .status-dot {{
       width: 7px;
@@ -2527,6 +2593,12 @@ def render_page(req_host: str) -> str:
     }}
     body.compact-view .name-text {{
       font-size: 12.5px;
+    }}
+    body.compact-view .cpu-bar {{
+      height: 5px;
+    }}
+    body.compact-view .cpu-cell {{
+      padding: 0 10px;
     }}
     body.compact-view .name-action-btn {{
       width: 22px;
@@ -2633,13 +2705,11 @@ def render_page(req_host: str) -> str:
           <button type="button" class="sort-btn" data-key="status">Status</button>
           <button type="button" class="sort-btn" data-key="port">Porta</button>
           <button type="button" class="sort-btn" data-key="name">Nome</button>
+          <button type="button" class="hidden-show-toggle" id="hidden-show-toggle" hidden title="Mostrar ocultos" aria-label="Mostrar containers ocultos" aria-pressed="false"></button>
         </div>
       </div>
 
       <div id="stacks"></div>
-      <div id="hidden-toggle-wrap" class="hidden-toggle-wrap" hidden>
-        <button type="button" class="hidden-toggle" id="hidden-toggle"></button>
-      </div>
       <div id="hidden-stacks" class="hidden-stacks" hidden></div>
       <div id="empty" class="empty" hidden></div>
     </div>
@@ -3049,6 +3119,11 @@ def render_page(req_host: str) -> str:
 
     function dotStyle(status) {{
       const s = status.toLowerCase();
+      if (!s.startsWith("up")) {{
+        return {{
+          dot: "#8b94a3", glow: "rgba(139,148,163,.18)",
+        }};
+      }}
       if (s.includes("second") || s.includes("minute")) {{
         return {{
           dot: "#d29922", glow: "rgba(210,153,34,.18)",
@@ -3070,6 +3145,31 @@ def render_page(req_host: str) -> str:
         return {{ color: "#f85149", bg: "rgba(248,81,73,.12)" }};
       }}
       return {{ color: "#8b94a3", bg: "rgba(139,148,163,.1)" }};
+    }}
+
+    function cpuBarColor(pct, running) {{
+      if (!running || pct == null) return "#8b94a3";
+      if (pct <= 0) return "#8b94a3";
+      if (pct <= 50) return "#e6e9ef";
+      if (pct <= 85) return "#e3b341";
+      return "#f85149";
+    }}
+
+    function renderCpuBar(c) {{
+      const running = isContainerRunning(c.status);
+      const pct = running ? (c.cpuPct ?? 0) : null;
+      const color = cpuBarColor(pct, running);
+      const width = running && pct != null ? Math.min(100, Math.max(0, pct)) : 0;
+      const title = running
+        ? `CPU ${{Number(pct ?? 0).toFixed(1)}}%`
+        : "Container parado";
+      return `
+        <div class="cpu-cell" title="${{esc(title)}}">
+          <div class="cpu-bar">
+            <span style="width:${{esc(String(width))}}%;background:${{esc(color)}};"></span>
+          </div>
+        </div>
+      `;
     }}
 
     function decorate(c) {{
@@ -3098,6 +3198,15 @@ def render_page(req_host: str) -> str:
         c.image.toLowerCase().includes(q) ||
         c.stack.toLowerCase().includes(q)
       );
+    }}
+
+    function isFlatView() {{
+      return Boolean(state.query.trim() || state.sortKey);
+    }}
+
+    function sortRows(rows) {{
+      const {{ sortKey, sortDir }} = state;
+      return [...rows].sort((a, b) => compareRows(a, b, sortKey, sortDir));
     }}
 
     function isEmptyStack(name) {{
@@ -3175,7 +3284,16 @@ def render_page(req_host: str) -> str:
     function buildLists(rows) {{
       const visibleRows = rows.filter((c) => !isHiddenContainer(c));
       const hiddenRows = rows.filter((c) => isHiddenContainer(c));
+      if (isFlatView()) {{
+        const flatSource = state.showHidden ? rows : visibleRows;
+        return {{
+          flat: true,
+          flatRows: sortRows(flatSource),
+          hiddenCount: hiddenRows.length,
+        }};
+      }}
       return {{
+        flat: false,
         visibleStacks: groupRowsIntoStacks(visibleRows, {{ withFavorites: true }}),
         hiddenStacks: groupRowsIntoStacks(hiddenRows, {{ withFavorites: false }}),
         hiddenCount: hiddenRows.length,
@@ -3560,11 +3678,12 @@ def render_page(req_host: str) -> str:
         ? `<button type="button" class="name-action-btn" data-action="stop" data-id="${{esc(c.id)}}" data-name="${{esc(c.name)}}" title="Parar" aria-label="Parar ${{esc(c.name)}}">${{STOP_ICON}}</button>`
         : `<button type="button" class="name-action-btn" data-action="start" data-id="${{esc(c.id)}}" data-name="${{esc(c.name)}}" title="Iniciar" aria-label="Iniciar ${{esc(c.name)}}">${{PLAY_ICON}}</button>`;
       return `
-        <div class="row">
+        <div class="row${{hidden ? " is-hidden" : ""}}">
           <div class="row-name">
             <span class="status-dot" style="background:${{c.dotColor}};box-shadow:0 0 0 3px ${{c.dotGlow}};"></span>
             <span class="name-text" title="${{esc(c.name)}}">${{esc(c.name)}}</span>
           </div>
+          ${{renderCpuBar(c)}}
           <div class="image-text" title="${{esc(c.image)}}">${{esc(c.image)}}</div>
           <div class="status-cell">
             <span class="status-pill" style="color:${{c.statusColor}};background:${{c.statusBg}}">${{esc(c.status)}}</span>
@@ -3630,21 +3749,27 @@ def render_page(req_host: str) -> str:
       return stacks.map((stack) => renderStackBlock(stack, {{ showStackHide }})).join("");
     }}
 
+    function renderFlatList(rows) {{
+      if (!rows.length) return "";
+      return `<div class="flat-list">${{rows.map((c) => renderContainerRow(decorate(c))).join("")}}</div>`;
+    }}
+
     function renderHiddenToggle(hiddenCount) {{
-      const wrap = document.getElementById("hidden-toggle-wrap");
-      const btn = document.getElementById("hidden-toggle");
+      const btn = document.getElementById("hidden-show-toggle");
+      if (!btn) return;
       if (!hiddenCount) {{
-        wrap.hidden = true;
+        btn.hidden = true;
         return;
       }}
-      wrap.hidden = false;
-      btn.textContent = state.showHidden
+      btn.hidden = false;
+      btn.innerHTML = HIDE_ICON;
+      btn.classList.toggle("active", state.showHidden);
+      const label = state.showHidden
         ? "Ocultar containers escondidos"
         : `Mostrar containers escondidos (${{hiddenCount}})`;
-      btn.setAttribute(
-        "aria-label",
-        state.showHidden ? "Ocultar containers escondidos" : `Mostrar ${{hiddenCount}} containers escondidos`
-      );
+      btn.title = label;
+      btn.setAttribute("aria-label", label);
+      btn.setAttribute("aria-pressed", state.showHidden ? "true" : "false");
     }}
 
     function renderSort() {{
@@ -3664,7 +3789,7 @@ def render_page(req_host: str) -> str:
 
     function renderStacks() {{
       const rows = filteredRows();
-      const {{ visibleStacks, hiddenStacks: hiddenStacksList, hiddenCount }} = buildLists(rows);
+      const lists = buildLists(rows);
       const root = document.getElementById("stacks");
       const hiddenRoot = document.getElementById("hidden-stacks");
       const empty = document.getElementById("empty");
@@ -3678,12 +3803,14 @@ def render_page(req_host: str) -> str:
         err.textContent = "";
       }}
 
-      renderHiddenToggle(hiddenCount);
+      renderHiddenToggle(lists.hiddenCount);
 
-      const hasVisibleStacks = visibleStacks.length > 0;
-      const showHiddenList = state.showHidden && hiddenStacksList.length > 0;
+      const hasVisible = lists.flat
+        ? lists.flatRows.length > 0
+        : lists.visibleStacks.length > 0;
+      const showHiddenList = !lists.flat && state.showHidden && lists.hiddenStacks.length > 0;
 
-      if (!hasVisibleStacks && !showHiddenList) {{
+      if (!hasVisible && !showHiddenList) {{
         root.innerHTML = "";
         hiddenRoot.hidden = true;
         hiddenRoot.innerHTML = "";
@@ -3691,19 +3818,21 @@ def render_page(req_host: str) -> str:
         if (!empty.hidden) {{
           empty.textContent = state.query.trim()
             ? `Nenhum container corresponde a "${{state.query}}".`
-            : "Nenhum container ativo.";
+            : "Nenhum container.";
         }}
         return;
       }}
 
       empty.hidden = true;
-      root.innerHTML = hasVisibleStacks
-        ? renderStacksHtml(visibleStacks, {{ showStackHide: true }})
+      root.innerHTML = hasVisible
+        ? (lists.flat
+          ? renderFlatList(lists.flatRows)
+          : renderStacksHtml(lists.visibleStacks, {{ showStackHide: true }}))
         : "";
 
       if (showHiddenList) {{
         hiddenRoot.hidden = false;
-        hiddenRoot.innerHTML = renderStacksHtml(hiddenStacksList, {{ showStackHide: true }});
+        hiddenRoot.innerHTML = renderStacksHtml(lists.hiddenStacks, {{ showStackHide: true }});
       }} else {{
         hiddenRoot.hidden = true;
         hiddenRoot.innerHTML = "";
@@ -4081,7 +4210,7 @@ def render_page(req_host: str) -> str:
     document.getElementById("stacks").addEventListener("click", handleStacksClick);
     document.getElementById("hidden-stacks").addEventListener("click", handleStacksClick);
 
-    document.getElementById("hidden-toggle").addEventListener("click", toggleShowHidden);
+    document.getElementById("hidden-show-toggle").addEventListener("click", toggleShowHidden);
 
     const fullscreenToggle = document.getElementById("fullscreen-toggle");
     if (document.fullscreenEnabled && fullscreenToggle) {{
